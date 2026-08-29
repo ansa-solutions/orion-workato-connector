@@ -182,8 +182,12 @@ pages for `/Portfolio/Accounts/{key}/Assets/Value` and its dated sibling:
 - Added `pathCalled` so the caller can see which of the two routes was used.
 
 `asOfDate` is correct as it stands: `/Assets/Value/{asOfDate}` is a documented endpoint in its own
-right. Note Swagger types that param as `date-time` while the connector sends `YYYY-MM-DD` — if the
-dated call errors while the plain one works, check the format first.
+right. **Confirmed working against staging:** `/Assets/Value/2026-07-06` returns 200, so the
+`YYYY-MM-DD` the connector sends is accepted even though Swagger types the param as `date-time`.
+
+Whether the date is actually *honoured* is still unproven. The dated and undated calls returned
+identical rows — but every value was zero in both, and zero equals zero, so that proves nothing
+either way. It needs an account that carries real valuations before the date can be trusted.
 
 ## Still open
 
