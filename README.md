@@ -6,12 +6,12 @@ Custom Workato connectors for the [Orion Advisor API](https://developers.orionad
 
 | File | Status |
 |------|--------|
-| `orion_advisor_connector.rb` | **Live.** "Orion Advisor Solutions" — the connector currently deployed in Workato. Mirrored here verbatim from the Workato editor. |
-| `orion_connection_only.rb` | **Legacy.** Connection-only stub of the previous connector, kept for auth debugging. Does not match the live connector. |
+| `orion_advisor_connector.rb` | **Live.** "Orion Advisor Solutions" — the connector deployed in Workato. Mirrored here verbatim from the Workato editor. |
 
 The previous connector — "Orion Advisor", a service-account + impersonation design with
 polling triggers and a custom-request escape hatch — was replaced, not evolved. It is still
-available at commit `775b3f8` if the impersonation approach is needed again.
+available at commit `775b3f8`, along with its `orion_connection_only.rb` auth-debugging stub,
+if the impersonation approach is needed again.
 
 > **Keep this file verbatim.** `orion_advisor_connector.rb` is a straight copy of what runs in
 > Workato, with no local edits or added comments, so the two can be diffed directly. Fix things
