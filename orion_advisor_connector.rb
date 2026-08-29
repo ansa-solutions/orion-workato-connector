@@ -74,10 +74,11 @@
         name: 'token_prefix',
         label: 'Token header prefix',
         control_type: 'select',
-        pick_list: [['Bearer', 'Bearer'], ['Session', 'Session']],
-        default: 'Bearer',
+        pick_list: [['Session', 'Session'], ['Bearer', 'Bearer']],
+        default: 'Session',
         optional: false,
-        hint: 'Orion data endpoints natively use Session. If sign in succeeds but data calls 401, switch to Session.'
+        hint: 'Orion data endpoints natively use Session. Bearer is kept only as a fallback - ' \
+              'if sign in succeeds but every data call 401s, you are on the wrong prefix.'
       },
       {
         name: 'identity_path',
@@ -148,10 +149,10 @@
           'expires_in' => res['expires_in']
         }
       end,
-      refresh_on: [401],
+      refresh_on: [401, 403],
       detect_on: [/"error"\s*:\s*"invalid_token"/],
       apply: lambda do |connection, access_token|
-        headers('Authorization' => "#{connection['token_prefix'].presence || 'Bearer'} #{access_token}")
+        headers('Authorization' => "#{connection['token_prefix'].presence || 'Session'} #{access_token}")
       end
     },
     base_uri: lambda do |connection|
@@ -170,6 +171,19 @@
       response_headers.find { |k, _| k.to_s.downcase == 'x-oas-correlationid' }&.last ||
         response_headers.find { |k, _| k.to_s.downcase == 'correlation-id' }&.last
     end,
+    to_bool: lambda do |value, default|
+      return default if value.nil? || value.to_s.strip.empty?
+      %w[true t yes y 1].include?(value.to_s.strip.downcase)
+    end,
+    identity_path: lambda do |connection|
+      path = connection['identity_path'].presence || '/api/v1/Authorization/User'
+      if path.start_with?('//') || !path.match?(%r{\A/[A-Za-z0-9._~%!$&'()*+,;=:@/-]*\z})
+        error("Identity endpoint path must be a plain path starting with a single '/'. " \
+              "Got: #{path}. A value carrying a host, a scheme, or a leading '//' would send " \
+              'the Orion access token to a different server.')
+      end
+      path
+    end,
     token_request: lambda do |connection, grant_label, payload|
       if connection['client_id'].blank? || connection['client_secret'].blank?
         error('Orion connection is missing a Client ID or Client Secret. ' \
@@ -184,11 +198,9 @@
       if %w[body both].include?(style)
         body['client_id']     = connection['client_id']
         body['client_secret'] = connection['client_secret']
-      elsif style == 'basic'
-        body['client_id'] = connection['client_id']
       end
       req_headers = {}
-      req_headers['App'] = 'OrionConnect' if connection['token_app_header'] == true
+      req_headers['App'] = 'OrionConnect' if call('to_bool', connection['token_app_header'], false)
       if %w[basic both].include?(style)
         req_headers['Authorization'] =
           "Basic #{"#{connection['client_id']}:#{connection['client_secret']}".encode_base64.gsub("\n", '')}"
@@ -225,12 +237,14 @@
         end
     end,
     fetch_identity: lambda do |connection, access_token|
-      prefix = connection['token_prefix'].presence || 'Bearer'
-      res = get("#{connection['environment']}#{connection['identity_path']}")
+      prefix = connection['token_prefix'].presence || 'Session'
+      path   = call('identity_path', connection)
+      res = get("#{connection['environment']}#{path}")
         .headers('Authorization' => "#{prefix} #{access_token}", 'App' => 'OrionConnect')
         .after_error_response(/.*/) do |code, body, _headers, message|
-          error("Signed in user lookup failed (#{code}) at #{connection['identity_path']}: #{message}. " \
-                "Body: #{body}. Auth succeeded, so this is a wrong path or a missing scope, not a credential problem.")
+          error("Signed in user lookup failed (#{code}) at #{path}: #{message}. " \
+                "Body: #{call('safe_body', connection, body, 500)}. " \
+                'Auth succeeded, so this is a wrong path or a missing scope, not a credential problem.')
         end
       email = res['email'] || res['emailAddress'] || res['userName'] || res['loginUserId']
       error('Orion returned no email on the identity endpoint. Advisor scoping cannot be enforced.') if email.blank?
@@ -243,7 +257,14 @@
     unwrap_array: lambda do |res|
       return [] if res.nil?
       return res.flatten(1) if res.is_a?(Array)
-      return [res] if res.is_a?(Hash)
+      if res.is_a?(Hash)
+        # Some Orion routes wrap the collection in an envelope. Returning [res] for those
+        # produces one nonsense row and a count of 1, which reads as a real (tiny) result.
+        %w[data items results rows records value].each do |k|
+          return res[k].flatten(1) if res[k].is_a?(Array)
+        end
+        return [res]
+      end
       arr = begin
         res.to_a
       rescue StandardError
@@ -265,7 +286,10 @@
       raw.to_s.split(',').map { |s| s.to_s.strip }.reject(&:blank?)
     end,
     row_account_keys: lambda do |row|
-      [row['accountId'], row['acctCode'], row['accountNumber'], row['number'], row['id']]
+      # Deliberately excludes row['id']: on the rep level books that is the beneficiary /
+      # systematic / RMD record's own id, not an account id, and matching on it returns
+      # rows belonging to a different client.
+      [row['accountId'], row['acctCode'], row['accountNumber'], row['number']]
         .compact.map { |v| v.to_s.strip.downcase }.reject(&:blank?).uniq
     end,
     filter_by_account_ids: lambda do |rows, raw_ids|
@@ -286,15 +310,36 @@
       alnum = s.gsub(/[^0-9A-Za-z]/, '')
       alnum.length > 4 ? "*#{alnum[-4, 4]}" : s
     end,
-    mask_rows: lambda do |connection, rows|
-      next rows if connection['mask_account_numbers'] == false
+    mask_account_id: lambda do |value|
+      s = value.to_s.strip
+      next s if s.blank?
+      # A real Orion accountId is a plain integer and must stay usable as a join key.
+      # Anything else is a custodian account code (e.g. "636-148526") and is an account
+      # number by another name, so it gets masked.
+      next s if s.match?(/\A\d+\z/)
+      call('mask_account_number', s)
+    end,
+    mask_any: lambda do |connection, obj|
+      next obj unless call('to_bool', connection['mask_account_numbers'], true)
       number_keys = %w[number accountNumber acctCode]
-      rows.map do |r|
-        next r unless r.is_a?(Hash)
-        r.map do |k, v|
-          number_keys.include?(k.to_s) ? [k, call('mask_account_number', v)] : [k, v]
+      if obj.is_a?(Hash)
+        obj.map do |k, v|
+          if number_keys.any? { |n| n.casecmp?(k.to_s) }
+            [k, call('mask_account_number', v)]
+          elsif k.to_s.casecmp?('accountId')
+            [k, call('mask_account_id', v)]
+          else
+            [k, call('mask_any', connection, v)]
+          end
         end.to_h
+      elsif obj.is_a?(Array)
+        obj.map { |v| call('mask_any', connection, v) }
+      else
+        obj
       end
+    end,
+    mask_rows: lambda do |connection, rows|
+      call('mask_any', connection, rows)
     end,
     scrub_pii: lambda do |obj|
       banned = %w[ssN_TaxID ssn taxId ccNum ccType ccToken ccIsValid]
@@ -307,8 +352,24 @@
         obj
       end
     end,
+    sanitize_any: lambda do |connection, obj|
+      call('mask_any', connection, call('scrub_pii', obj))
+    end,
     sanitize_rows: lambda do |connection, rows|
-      call('mask_rows', connection, call('scrub_pii', rows))
+      call('sanitize_any', connection, rows)
+    end,
+    safe_body: lambda do |connection, body, limit|
+      # Error bodies from the portfolio and billing routes carry client names, emails,
+      # addresses and account numbers straight into permanent job history. Scrub and mask
+      # them the same way a successful response would be.
+      cap = limit || 500
+      parsed = begin
+        workato.parse_json(body.to_s)
+      rescue StandardError
+        nil
+      end
+      next call('sanitize_any', connection, parsed).to_json[0, cap] if parsed.present?
+      body.to_s.gsub(/\d{6,}/) { |d| "*#{d[-4, 4]}" }[0, cap]
     end
   },
   test: lambda do |connection|
@@ -327,16 +388,20 @@
                   'Echoed raw in the output so you can see what claims exist. ' \
                   'The connector cannot read this on its own - it must be mapped here.' },
           { name: 'verified_user_email', type: :string, label: 'Verified user email', optional: true,
-            hint: 'RECIPE SIDE ONLY. Formula mode, the JWT claims datapill with ["email"] appended.' }
+            hint: 'RECIPE SIDE ONLY. Formula mode, the JWT claims datapill with ["email"] appended.' },
+          { name: 'echo_claims', type: :boolean, label: 'Echo raw JWT claims', default: false,
+            hint: 'Off in production. When on, the full claim set is returned in jwtClaimsRaw so ' \
+                  'you can read what Workato actually resolves. Claims are identity data - do not ' \
+                  'leave this on in a recipe that logs its output.' }
         ]
       end,
       execute: lambda do |connection, input|
-        path = connection['identity_path'].presence || '/api/v1/Authorization/User'
+        path = call('identity_path', connection)
         res = get(path)
           .headers('App' => 'OrionConnect')
           .after_error_response(/.*/) do |code, body, headers, message|
             error("Orion live identity lookup failed (#{code}) at #{path}: #{message}. " \
-                  "Body: #{body.to_s[0, 300]}. " \
+                  "Body: #{call('safe_body', connection, body, 300)}. " \
                   'This action reads identity from Orion at call time, so a failure here means the ' \
                   'connection resolved for this caller is not usable. ' \
                   "Correlation ID: #{call('orion_correlation_id', headers)}")
@@ -348,13 +413,15 @@
 
         claims_raw = input['jwt_claims'].to_s
         verified   = input['verified_user_email'].to_s.strip.downcase
-        if verified.blank? && claims_raw.present?
-          parsed = begin
-            workato.parse_json(claims_raw)
-          rescue StandardError
-            nil
-          end
-          verified = (parsed.is_a?(Hash) ? (parsed['email'] || parsed['upn'] || parsed['preferred_username']) : nil).to_s.strip.downcase
+        parsed = if claims_raw.present?
+                   begin
+                     workato.parse_json(claims_raw)
+                   rescue StandardError
+                     nil
+                   end
+                 end
+        if verified.blank? && parsed.is_a?(Hash)
+          verified = (parsed['email'] || parsed['upn'] || parsed['preferred_username']).to_s.strip.downcase
         end
 
         {
@@ -366,7 +433,9 @@
             (found && connection['user_email'].present?) ? (live_email == connection['user_email'].to_s.downcase) : nil,
           'identitySource' => found ? 'live' : 'not_found',
           'verifiedUserEmail' => verified.presence || 'not_supplied',
-          'jwtClaimsRaw' => claims_raw.presence || 'not_supplied',
+          'jwtClaimsRaw' => call('to_bool', input['echo_claims'], false) ?
+            (claims_raw.presence || 'not_supplied') : 'not_echoed',
+          'jwtClaimsParsed' => claims_raw.present? ? parsed.is_a?(Hash) : nil,
           'verifiedMatchesOrion' => (verified.present? && found) ? (verified == live_email) : nil
         }
       end,
@@ -389,8 +458,12 @@
                   'Reads "not_supplied" when nothing was mapped. THIS is the trustworthy advisor identity ' \
                   'if it populates - it is platform resolved from a signed JWT, not caller payload.' },
           { name: 'jwtClaimsRaw', type: :string,
-            hint: 'Raw echo of whatever was mapped, so you can read the full claim set once and see ' \
-                  'what is actually available. Diagnostic, remove from production output.' },
+            hint: 'Reads "not_echoed" unless Echo raw JWT claims is switched on. Diagnostic only - ' \
+                  'the claim set is identity data.' },
+          { name: 'jwtClaimsParsed', type: :boolean,
+            hint: 'FALSE means claims were mapped but could not be parsed as JSON, so verifiedUserEmail ' \
+                  'is blank because of a mapping problem rather than because nothing was supplied. ' \
+                  'Null when no claims were mapped at all.' },
           { name: 'verifiedMatchesOrion', type: :boolean,
             hint: 'TRUE means the Workato verified user and the Orion connection are the same person. ' \
                   'FALSE is the ria1 vs ria2 split you have been seeing. Null when either is blank.' }
@@ -412,11 +485,12 @@
         ]
       end,
       execute: lambda do |connection, input|
+        limit = input['top'].nil? ? 200 : input['top'].to_i
         params = {
           'representativeId' => input['representativeId'],
           'clientId' => input['clientId'],
           'isActive' => input['isActive'].nil? ? 'true' : input['isActive'].to_s,
-          'top' => input['top'] ? input['top'].to_i : 200
+          'top' => limit
         }.reject { |_, v| v.nil? }
         res = get('/api/v1/Portfolio/Clients')
           .params(params)
@@ -430,12 +504,13 @@
                      'Route exists. Auth or parameter problem, not routing.'
                    end
             error("Orion Clients Error (#{code}): #{message}. #{hint} " \
-                  "Body: #{body.to_s[0, 500]}. Correlation ID: #{call('orion_correlation_id', headers)}")
+                  "Body: #{call('safe_body', connection, body, 500)}. " \
+                  "Correlation ID: #{call('orion_correlation_id', headers)}")
           end
-        if input['diagnostic']
+        if call('to_bool', input['diagnostic'], false)
           detected = res.is_a?(Array) ? 'array' : (res.is_a?(Hash) ? 'hash' : 'scalar')
           next {
-            'raw' => { 'response' => call('scrub_pii', res) },
+            'raw' => { 'response' => call('sanitize_any', connection, res) },
             'detectedType' => detected,
             'advisorEmail' => connection['user_email']
           }
@@ -445,7 +520,8 @@
           'clients' => clients,
           'clientCount' => clients.length,
           'advisorEmail' => connection['user_email'],
-          'repScoped' => input['representativeId'].present?
+          'repScoped' => input['representativeId'].present?,
+          'truncated' => clients.length >= limit
         }
       end,
       output_fields: lambda do
@@ -471,7 +547,10 @@
           { name: 'repScoped', type: :boolean,
             hint: 'F1. FALSE means no Representative ID was supplied and this is a TENANT WIDE result. ' \
                   'Assert on this in the recipe before showing anything to an advisor.' },
-          { name: 'raw', type: :object, hint: 'Diagnostic mode only.' },
+          { name: 'truncated', type: :boolean,
+            hint: 'TRUE means the result hit the record limit and more rows exist that you did not ' \
+                  'receive. Never summarize or count a truncated set for an advisor.' },
+          { name: 'raw', type: :object, hint: 'Diagnostic mode only. Masked and scrubbed like any other output.' },
           { name: 'detectedType', type: :string, hint: 'Diagnostic mode only.' }
         ]
       end
@@ -494,6 +573,7 @@
         ]
       end,
       execute: lambda do |connection, input|
+        limit = input['top'].nil? ? 200 : input['top'].to_i
         params = {
           'householdFilter' => input['householdFilter'].presence,
           'representativeId' => input['rep_id'],
@@ -501,7 +581,7 @@
           'registrationId' => input['registrationId'],
           'isActive' => input['isActive'].nil? ? 'true' : input['isActive'].to_s,
           'refreshCache' => input['refreshCache'].nil? ? 'false' : input['refreshCache'].to_s,
-          'top' => input['top'] ? input['top'].to_i : 200
+          'top' => limit
         }.reject { |_, v| v.nil? }
         res = get('/api/v1/Portfolio/Clients/Grid')
           .params(params)
@@ -516,7 +596,8 @@
           'clientCount' => clients.length,
           'advisorEmail' => connection['user_email'],
           'repScoped' => input['rep_id'].present?,
-          'distinctRepIds' => reps.join(',')
+          'distinctRepIds' => reps.join(','),
+          'truncated' => clients.length >= limit
         }
       end,
       output_fields: lambda do
@@ -544,7 +625,10 @@
           { name: 'repScoped', type: :boolean,
             hint: 'FALSE means tenant wide. Stop the recipe rather than showing cross rep data.' },
           { name: 'distinctRepIds', type: :string,
-            hint: 'Cheap assertion: if this holds more than the one rep you scoped to, scoping did not take effect.' }
+            hint: 'Cheap assertion: if this holds more than the one rep you scoped to, scoping did not take effect.' },
+          { name: 'truncated', type: :boolean,
+            hint: 'TRUE means the result hit the record limit and more rows exist that you did not ' \
+                  'receive. Never summarize or count a truncated set for an advisor.' }
         ]
       end
     },
@@ -565,6 +649,7 @@
         ]
       end,
       execute: lambda do |connection, input|
+        limit = input['top'].nil? ? 50 : input['top'].to_i
         params = {
           'accountFilter' => input['accountFilter'].presence,
           'representativeId' => input['representativeId'],
@@ -573,7 +658,7 @@
           'isActive' => input['isActive'].nil? ? 'true' : input['isActive'].to_s,
           'refreshCache' => input['refreshCache'].nil? ? 'false' : input['refreshCache'].to_s,
           'returnStyle' => input['returnStyle'].presence || 'Standard',
-          'top' => input['top'] ? input['top'].to_i : 50
+          'top' => limit
         }.reject { |_, v| v.nil? }
         res = get('/api/v1/Portfolio/Accounts/Grid')
           .params(params)
@@ -588,7 +673,8 @@
           'accounts' => accounts,
           'accountCount' => accounts.length,
           'totalValue' => total.round(2),
-          'repScoped' => input['representativeId'].present? || input['clientId'].present?
+          'repScoped' => input['representativeId'].present? || input['clientId'].present?,
+          'truncated' => accounts.length >= limit
         }
       end,
       output_fields: lambda do
@@ -624,8 +710,13 @@
             ]
           },
           { name: 'accountCount', type: :integer, hint: 'Fills "N TOTAL ACCTS" when called with a clientId.' },
-          { name: 'totalValue', type: :number },
-          { name: 'repScoped', type: :boolean, hint: 'FALSE means tenant wide.' }
+          { name: 'totalValue', type: :number,
+            hint: 'Sum of currentValue across the rows returned. If truncated is TRUE this is a ' \
+                  'partial sum, not the account total.' },
+          { name: 'repScoped', type: :boolean, hint: 'FALSE means tenant wide.' },
+          { name: 'truncated', type: :boolean,
+            hint: 'TRUE means the result hit the record limit and more rows exist that you did not ' \
+                  'receive. totalValue and accountCount are both understated when this is TRUE.' }
         ]
       end
     },
@@ -848,13 +939,14 @@
         ]
       end,
       execute: lambda do |connection, input|
-        path = if input['verbose'].to_s.downcase == 'true'
+        verbose = call('to_bool', input['verbose'], false)
+        path = if verbose
                  "/api/v1/Portfolio/Clients/Verbose/#{input['clientId'].to_i}"
                else
                  "/api/v1/Portfolio/Clients/#{input['clientId'].to_i}"
                end
         params = {}
-        if input['verbose'].to_s.downcase == 'true' && input['expand'].present?
+        if verbose && input['expand'].present?
           params['expand'] = input['expand'].to_s.gsub(' ', '')
         end
         res = get(path)
@@ -866,12 +958,11 @@
                     "Correlation ID: #{call('orion_correlation_id', headers)}")
             else
               error("Orion Client Detail Error (#{code}) at #{path}: #{message}. " \
-                    "Body: #{body.to_s[0, 500]}. " \
+                    "Body: #{call('safe_body', connection, body, 500)}. " \
                     "Correlation ID: #{call('orion_correlation_id', headers)}")
             end
           end
-        detail = call('scrub_pii', call('unwrap_hash', res))
-        call('mask_rows', connection, [detail]).first
+        call('sanitize_any', connection, call('unwrap_hash', res))
       end,
       output_fields: lambda do
         [
@@ -1047,7 +1138,15 @@
         ]
       end,
       execute: lambda do |connection, input|
-        term = input['search'].to_s.strip.gsub(' ', '%20')
+        term = input['search'].to_s.strip
+        error('Search term cannot be blank.') if term.blank?
+        # This value is interpolated into the request PATH. Escaping only spaces lets a term
+        # containing / ? # or % rewrite the route being called.
+        if term.match?(%r{[/?\#%]})
+          error("Search term contains a character that would rewrite the request path: #{term}. " \
+                'Remove / ? # and % and retry.')
+        end
+        term = term.gsub(' ', '%20')
         res = get("/api/v1/Portfolio/Accounts/Simple/Search/#{term}")
           .headers(call('orion_headers', '/portfolio/accounts'))
           .after_error_response(/.*/) do |code, body, headers, message|
@@ -1065,10 +1164,11 @@
           accounts = accounts.select { |a| a['clientId'].to_s.strip == target }
         end
         id_list = accounts.map { |a| a['id'] }.compact.join(',')
-        accounts = call('scrub_pii', accounts)
-        if input['maskAccountNumbers'].nil? || input['maskAccountNumbers'] || connection['mask_account_numbers'] != false
-          accounts = call('mask_rows', connection.merge('mask_account_numbers' => true), accounts)
-        end
+        # Either switch asks for masking, masking happens. Only turning BOTH off returns
+        # account numbers in full.
+        mask = call('to_bool', input['maskAccountNumbers'], true) ||
+               call('to_bool', connection['mask_account_numbers'], true)
+        accounts = call('sanitize_any', connection.merge('mask_account_numbers' => mask), accounts)
         {
           'accounts' => accounts,
           'accountCount' => accounts.length,
@@ -1159,7 +1259,8 @@
           { name: 'accountId', type: :integer, label: 'Account ID', optional: false },
           { name: 'asOfDate', type: :date, label: 'As Of Date', optional: true },
           { name: 'cashKeywords', type: :string, label: 'Cash match keywords', default: 'cash,money market,sweep,mmkt',
-            hint: 'Comma separated, matched case insensitively against the asset class and name fields.' }
+            hint: 'Comma separated, matched case insensitively against the asset class and name fields. ' \
+                  'isCustodialCash is checked first and wins outright when present.' }
         ]
       end,
       execute: lambda do |connection, input|
@@ -1191,7 +1292,8 @@
           'cashValue' => cash.round(2),
           'cashPercent' => total.zero? ? 0 : ((cash / total) * 100).round(2),
           'cashClassificationFields' => 'isCustodialCash (authoritative), then assetClass, productCategory, assetClassName, name',
-          'costBasisPopulated' => assets.any? { |a| (a['costBasis'] || 0).to_f > 0 }
+          'costBasisPopulated' => assets.any? { |a| a.key?('costBasis') } ?
+            assets.any? { |a| (a['costBasis'] || 0).to_f > 0 } : nil
         }
       end,
       output_fields: lambda do
@@ -1213,7 +1315,10 @@
               { name: 'shares', type: :number, hint: 'Confirmed live. The declared currentShares does not exist.' },
               { name: 'price', type: :number, hint: 'Confirmed live. The declared currentPrice does not exist.' },
               { name: 'value', type: :number, hint: 'Confirmed live. Per position dollar amount.' },
-              { name: 'currentValue', type: :number, hint: 'Added by the connector, normalized from value.' }
+              { name: 'currentValue', type: :number, hint: 'Added by the connector, normalized from value.' },
+              { name: 'costBasis', type: :number,
+                hint: 'Not present in the confirmed live response on this tenant. Declared so ' \
+                      'costBasisPopulated has a field to read when Orion does return it.' }
             ]
           },
           { name: 'assetCount', type: :integer },
@@ -1221,7 +1326,9 @@
           { name: 'cashValue', type: :number, hint: 'Dollar half of the template line.' },
           { name: 'cashPercent', type: :number, hint: 'Percent half of the template line.' },
           { name: 'cashClassificationFields', type: :string, hint: 'Which fields the match ran against.' },
-          { name: 'costBasisPopulated', type: :boolean, hint: 'Answers the "is cost basis complete" half of the prompt directly.' }
+          { name: 'costBasisPopulated', type: :boolean,
+            hint: 'NULL means Orion returned no costBasis field at all on any position - that is a ' \
+                  '"cannot tell", not a "cost basis is missing". TRUE/FALSE only when the field exists.' }
         ]
       end
     },
@@ -1266,17 +1373,23 @@
                           desc.include?('withdraw') || desc.include?('distribution')
                         end
                       end
-        total = withdrawals.inject(0.0) { |sum, t| sum + (t['amount'] || t['transAmount'] || 0).to_f.abs }
+        amounts = withdrawals.map { |t| (t['amount'] || t['transAmount'] || 0).to_f }
+        # Sum signed, then take the magnitude. Taking .abs per row silently adds a positive
+        # contribution that matched "distribution" in the keyword path.
+        signed = amounts.inject(0.0) { |sum, a| sum + a }
+        total  = signed.abs
         {
           'accountId' => input['accountId'].to_i,
           'transactions' => call('sanitize_rows', connection, txns),
           'transactionCount' => txns.length,
           'withdrawalTotal' => total.round(2),
+          'withdrawalNetSigned' => signed.round(2),
           'withdrawalCount' => withdrawals.length,
+          'mixedSigns' => amounts.reject(&:zero?).map(&:negative?).uniq.length > 1,
           'startDate' => start_date.strftime('%Y-%m-%d'),
           'endDate' => end_date.strftime('%Y-%m-%d'),
           'matchedBy' => type_ids.present? ? 'typeId' : 'description keyword fallback',
-          'zeroIsUnverified' => (total.zero? && txns.present? && type_ids.blank?)
+          'zeroIsUnverified' => (total.zero? && txns.present?)
         }
       end,
       output_fields: lambda do
@@ -1299,14 +1412,24 @@
             ]
           },
           { name: 'transactionCount', type: :integer },
-          { name: 'withdrawalTotal', type: :number, hint: 'Feeds the "YTD WD $" template field.' },
+          { name: 'withdrawalTotal', type: :number,
+            hint: 'Feeds the "YTD WD $" template field. Magnitude of the signed net, not a sum of ' \
+                  'absolute values.' },
+          { name: 'withdrawalNetSigned', type: :number,
+            hint: 'The signed net before taking magnitude. If this and withdrawalTotal disagree in ' \
+                  'sign, the matched set is not purely withdrawals.' },
           { name: 'withdrawalCount', type: :integer },
+          { name: 'mixedSigns', type: :boolean,
+            hint: 'TRUE means the matched rows contain both debits and credits, so the match rule is ' \
+                  'catching contributions as well as withdrawals. Investigate before reporting.' },
           { name: 'startDate', type: :string },
           { name: 'endDate', type: :string },
           { name: 'matchedBy', type: :string, hint: 'Warn in the recipe if this reads "description keyword fallback".' },
           { name: 'zeroIsUnverified', type: :boolean,
             hint: 'TRUE means the account HAD transactions but none matched the withdrawal rule, so the $0 ' \
-                  'is a matching failure, not a real zero. Never report $0 to an advisor when this is true.' }
+                  'is a matching failure, not a real zero. Never report $0 to an advisor when this is true. ' \
+                  'Now also fires when withdrawalTypeIds were supplied but matched nothing - that is the ' \
+                  'case most likely to be believed.' }
         ]
       end
     },
@@ -1546,10 +1669,11 @@
         ]
       end,
       execute: lambda do |connection, input|
+        limit = input['top'].nil? ? 500 : input['top'].to_i
         res = get('/api/v1/Portfolio/Registrations')
           .params(
             'isActive' => input['isActive'].nil? ? 'true' : input['isActive'].to_s,
-            'top' => input['top'] ? input['top'].to_i : 500
+            'top' => limit
           )
           .headers(call('orion_headers', '/portfolio/registrations'))
           .after_error_response(/.*/) do |code, _body, headers, message|
@@ -1557,7 +1681,8 @@
                   "Correlation ID: #{call('orion_correlation_id', headers)}")
           end
         regs = call('sanitize_rows', connection, call('unwrap_array', res))
-        { 'registrations' => regs, 'registrationCount' => regs.length }
+        { 'registrations' => regs, 'registrationCount' => regs.length,
+          'truncated' => regs.length >= limit }
       end,
       output_fields: lambda do
         [
@@ -1573,7 +1698,9 @@
               { name: 'isActive', type: :boolean }
             ]
           },
-          { name: 'registrationCount', type: :integer }
+          { name: 'registrationCount', type: :integer },
+          { name: 'truncated', type: :boolean,
+            hint: 'TRUE means the result hit the record limit and more rows exist that you did not receive.' }
         ]
       end
     },
@@ -1638,27 +1765,34 @@
           { name: 'isActive', type: :boolean, label: 'Is Active Only', default: true },
           { name: 'status', type: :string, label: 'Status', optional: true,
             hint: 'Confirmed query param. Blank in the confirmed working call. Accepted values unconfirmed.' },
-          { name: 'top', type: :integer, label: 'Top / Record Limit', default: 50000 },
+          { name: 'top', type: :integer, label: 'Top / Record Limit', default: 1000,
+            hint: 'Was 50000. Every row is scrubbed and masked in memory, so a tenant sized pull ' \
+                  'risks a job timeout. Raise deliberately and watch the truncated flag.' },
           { name: 'diagnostic', type: :boolean, label: 'Diagnostic mode', default: false,
             hint: 'Returns the untouched response so the real shape can be read first.' }
         ]
       end,
       execute: lambda do |connection, input|
+        limit = input['top'].nil? ? 1000 : input['top'].to_i
         params = {
           'isActive' => input['isActive'].nil? ? 'true' : input['isActive'].to_s,
           'status' => input['status'].presence,
-          'top' => input['top'] ? input['top'].to_i : 50000
+          'top' => limit
         }.reject { |_, v| v.nil? }
         res = get('/api/v1/Billing/Clients/Grid')
           .params(params)
           .headers(call('orion_headers', '/billing/clients'))
           .after_error_response(/.*/) do |code, body, headers, message|
             error("Orion Billing Clients Grid Error (#{code}): #{message}. " \
-                  "Body: #{body.to_s[0, 500]}. " \
+                  "Body: #{call('safe_body', connection, body, 500)}. " \
                   "Correlation ID: #{call('orion_correlation_id', headers)}")
           end
-        next { 'raw' => { 'response' => call('scrub_pii', res) } } if input['diagnostic'].to_s.downcase == 'true'
+        if call('to_bool', input['diagnostic'], false)
+          next { 'raw' => { 'response' => call('sanitize_any', connection, res) } }
+        end
         rows = call('unwrap_array', res).select { |r| r.is_a?(Hash) }
+        # Measured against what Orion returned, before the client side filters below.
+        truncated = rows.length >= limit
         rows = rows.map { |r| r.reject { |k, _| k.to_s.start_with?('udf') || k == 'additionalColumns' } }
         if input['clientId'].present?
           target = input['clientId'].to_s.strip
@@ -1672,7 +1806,8 @@
         {
           'billingClients' => rows,
           'billingClientCount' => rows.length,
-          'feeScheduleResolved' => rows.all? { |r| r['feeSchedule'].present? }
+          'feeScheduleResolved' => rows.all? { |r| r['feeSchedule'].present? },
+          'truncated' => truncated
         }
       end,
       output_fields: lambda do
@@ -1710,7 +1845,11 @@
           { name: 'feeScheduleResolved', type: :boolean,
             hint: 'FALSE means at least one row has no fee schedule. Say the fee must be confirmed from the ' \
                   'advisory agreement. Never estimate a fee.' },
-          { name: 'raw', type: :object, hint: 'Diagnostic mode only.' }
+          { name: 'truncated', type: :boolean,
+            hint: 'TRUE means Orion hit the record limit before the client side clientId / ' \
+                  'representativeNumber filters ran, so the row you were looking for may simply ' \
+                  'not have been in the page that came back.' },
+          { name: 'raw', type: :object, hint: 'Diagnostic mode only. Masked and scrubbed like any other output.' }
         ]
       end
     },
@@ -1731,26 +1870,28 @@
                   .headers(call('orion_headers', '/billing/schedules'))
                   .after_error_response(/.*/) do |code, body, headers, message|
                     error("Orion Billing Schedule Error (#{code}): #{message}. " \
-                          "Body: #{body.to_s[0, 500]}. " \
+                          "Body: #{call('safe_body', connection, body, 500)}. " \
                           "Correlation ID: #{call('orion_correlation_id', headers)}")
                   end
               else
                 get('/api/v1/Billing/Schedules')
-                  .params('top' => input['top'] ? input['top'].to_i : 200)
+                  .params('top' => input['top'].nil? ? 200 : input['top'].to_i)
                   .headers(call('orion_headers', '/billing/schedules'))
                   .after_error_response(/.*/) do |code, body, headers, message|
                     error("Orion Billing Schedules Error (#{code}): #{message}. " \
-                          "Body: #{body.to_s[0, 500]}. " \
+                          "Body: #{call('safe_body', connection, body, 500)}. " \
                           "Correlation ID: #{call('orion_correlation_id', headers)}")
                   end
               end
-        next { 'raw' => { 'response' => call('scrub_pii', res) } } if input['diagnostic'].to_s.downcase == 'true'
+        if call('to_bool', input['diagnostic'], false)
+          next { 'raw' => { 'response' => call('sanitize_any', connection, res) } }
+        end
         rows = call('unwrap_array', res).select { |r| r.is_a?(Hash) }
         if input['scheduleId'].present?
           target = input['scheduleId'].to_s.strip
           rows = rows.select { |r| r['id'].to_s.strip == target }
         end
-        { 'schedules' => call('scrub_pii', rows), 'scheduleCount' => rows.length }
+        { 'schedules' => call('sanitize_rows', connection, rows), 'scheduleCount' => rows.length }
       end,
       output_fields: lambda do
         [
@@ -1772,7 +1913,7 @@
             ]
           },
           { name: 'scheduleCount', type: :integer },
-          { name: 'raw', type: :object, hint: 'Diagnostic mode only.' }
+          { name: 'raw', type: :object, hint: 'Diagnostic mode only. Masked and scrubbed like any other output.' }
         ]
       end
     }
