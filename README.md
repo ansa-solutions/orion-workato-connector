@@ -1,97 +1,99 @@
 # Orion Advisor — Workato Connector
 
-A custom Workato connector for the [Orion Advisor API](https://developers.orionadvisor.com/).
+Custom Workato connectors for the [Orion Advisor API](https://developers.orionadvisor.com/).
 
-## Authentication — OAuth 2.0 (authorization code)
+## What is in this repo
 
-The connector uses OAuth 2.0 so **no user id or password is stored**. An Orion user
-logs in once via the browser; Workato keeps and auto-refreshes the tokens.
-Per Orion's [OAuth guide](https://developers.orionadvisor.com/guides/oauth/):
+| File | Status |
+|------|--------|
+| `orion_advisor_connector.rb` | **Live.** "Orion Advisor Solutions" — the connector currently deployed in Workato. Mirrored here verbatim from the Workato editor. |
+| `orion_connection_only.rb` | **Legacy.** Connection-only stub of the previous connector, kept for auth debugging. Does not match the live connector. |
 
-1. **Authorize:** browser is sent to `{base}/api/oauth/?response_type=code&redirect_uri=…&client_id=…&state=…`
-   (path is `/api/oauth/` — **no** version segment, or Orion shows its native login dialog).
-2. **Token exchange:** `POST {base}/api/v1/Security/Token` with query params
-   `grant_type=authorization_code&code=…&client_id=…&client_secret=…&redirect_uri=…&response_type=code`.
-3. Response: `access_token` (~10h JWT), `refresh_token` (375 days), `expires_in`.
-4. Every subsequent call sends **`Authorization: Session <access_token>`**.
+The previous connector — "Orion Advisor", a service-account + impersonation design with
+polling triggers and a custom-request escape hatch — was replaced, not evolved. It is still
+available at commit `775b3f8` if the impersonation approach is needed again.
 
-`refresh_on: [401, 403]` refreshes transparently. **Orion rotates refresh tokens** — the
-old token is voided once used, so the connector persists the new `refresh_token` returned
-on each refresh.
+> **Keep this file verbatim.** `orion_advisor_connector.rb` is a straight copy of what runs in
+> Workato, with no local edits or added comments, so the two can be diffed directly. Fix things
+> in Workato first, then re-sync here.
 
-### Setup
-1. **Whitelist the redirect URI with Orion:** `https://www.workato.com/oauth/callback`
-   (Orion must register this for your `client_id`).
-2. In Workato, enter **Environment**, **Client ID**, **Client Secret**, then click
-   **Connect** and log in through Orion. Do **not** use a firm API user account for this
-   browser login — Orion disallows it.
+## Authentication — OAuth 2.0 (authorization code), per advisor
+
+Each advisor authorizes their own connection; there is no shared service account and no
+impersonation. At sign-in the connector exchanges the code at
+`POST {base}/api/v1/Security/Token`, then calls the identity endpoint
+(`/api/v1/Authorization/User` by default) and stores the returned email as the connection owner
+plus `user_email` / `user_id` / `rep_id`.
+
+Client credentials are sent as **form-urlencoded body fields** by default. The
+**Client authentication** field can switch to HTTP Basic, or to both (diagnostic only —
+RFC 6749 §2.3.1 forbids mixing, and many servers answer with a bare 401 and no body).
 
 ### Connection fields
+
 | Field | Notes |
 |-------|-------|
-| Environment | Production (`api.orionadvisor.com`) or Staging (`stagingapi.orionadvisor.com`) |
-| Client ID / Client Secret | Partner credentials provided by Orion |
+| Environment | Full host URL. Staging (default) or Production. Must match where the OAuth app is registered. |
+| Client ID / Client Secret | Issued by Orion. |
+| Client authentication | `body` (default), `basic`, or `both`. |
+| Send App header on token requests | Off by default; data endpoints always send `App: OrionConnect`. |
+| Redirect URI | `https://www.workato.com/oauth/callback` — must be registered with Orion. |
+| Scope | Optional, space delimited. |
+| Token header prefix | `Bearer` (default) or `Session`. See the open issues below. |
+| Identity endpoint path | `/api/v1/Authorization/User`. Called at sign-in and by Get Signed In User. |
+| Mask account numbers everywhere | On by default. Leaves only the last 4 on account-number fields. |
 
-> No service-account / client-credentials flow exists in Orion — a human must complete the
-> browser login once. After ~375 days the refresh token expires and someone re-authorizes.
+## Actions (21)
 
-## What changed vs. the original Python script
+**Identity** — Get Signed In User (live Orion lookup on every call, plus optional JWT-claim echo).
 
-The original script used **Basic auth** done incorrectly. This connector uses OAuth instead, but
-for reference the script's bugs were: it `POST`ed to the token endpoint (should be `GET`),
-put `Authorization`/`client_id`/`client_secret` in the **body** (should be **headers**),
-never reused the token, and never sent `Authorization: Session <token>` on API calls.
+**Clients** — List Clients · List Clients (Grid View) · Get Client Detail (standard or
+`Verbose/{id}` with `expand`) · Get Client Registrations.
 
-## Actions
-- **Get impersonation token** — mint a token scoped to a rep/client (see below)
-- **Search clients** — `GET /api/v1/Portfolio/Clients`
-- **Get client by ID** — `GET /api/v1/Portfolio/Clients/{id}`
-- **Search accounts** — `GET /api/v1/Portfolio/Accounts`
-- **Get account by ID** — `GET /api/v1/Portfolio/Accounts/{id}`
-- **Send custom request** — escape hatch to call any Orion endpoint (any verb, query params, body)
+**Accounts** — List Accounts (Grid View) · Search Accounts (Simple) · Get Account Value ·
+Get Account Asset Values (with cash rollup) · Get Account Transactions (with withdrawal rollup).
 
-Every data action (and Send custom request) has an optional **Impersonation token** input.
+**Rep-level books** — Get Beneficiaries (by Rep) · Get Systematics (by Rep) · Get RMD (by Rep).
+All three fetch the whole rep book and filter client-side to supplied account IDs.
 
-## Impersonation (dynamic, per recipe step)
+**Reference** — List Registrations · List Transaction Types · List Portfolio Assets.
 
-Per Orion's [impersonation guide](https://developers.orionadvisor.com/guides/impersonation/),
-impersonation is a token exchange: authenticate normally, then call
-`GET /api/v1/security/token` again with `Authorization: Impersonate <service_token>` plus
-headers `Entity` (4 = Representative, 5 = Client), `EntityId`, and optional `LoginName`.
-That returns a fresh `Session` token scoped to the target user.
+**Billing** — List Billing Clients · List Billing Schedules.
 
-**Recipe pattern:**
-1. **Get impersonation token** → choose *Representative* or *Client*, enter the Entity ID.
-   Returns an **Impersonation token** (~10h lifetime).
-2. In any later step (e.g. *Search accounts*, *Send custom request*), drop that token into
-   the **Impersonation token** field. That call runs as the impersonated user; leave it
-   blank to run as the service account. You can impersonate different users in different
-   steps of the same recipe.
+**Untested against staging** — Get Household Portfolio Cards ·
+Get Performance & Allocation Summary · Get Benchmark & Risk Profile.
 
-### How it works internally
-The service OAuth access token only exists inside the connection's `apply` block, so the
-connector signals impersonation through flags it sets on the `connection` object, which
-`apply` reads:
-- `_imp_exchange` → send the service token with the **Impersonate** scheme (minting).
-- `_imp_token` → send that token with the **Session** scheme (acting as the user).
+## Scoping model — read this before building a recipe
 
-This is deterministic regardless of how Workato orders `apply` vs. action-level headers.
-> If your Workato runtime freezes the `connection` object inside actions, this technique
-> can't set those flags — in that case switch to **connection-level** impersonation
-> (one connection per impersonated identity). Ask and I'll add that variant.
+Scope is **not** enforced server-side. Orion returns the whole tenant (~56,000 households) when
+`representativeId` is omitted. The connector reports what it did rather than blocking:
 
-## Triggers (polling — Orion REST has no webhooks)
-- **New client** — emits clients with an ID higher than any seen before
-- **New account** — emits accounts with an ID higher than any seen before
+- `repScoped` — FALSE means the result is tenant-wide. Assert on it before showing anything.
+- `distinctRepIds` — more than the one rep you scoped to means scoping did not take effect.
+- `filtered` / `rowsBeforeFilter` / `unmatchedAccountIds` / `idFormatWarning` — on the rep-level
+  books, these distinguish "no match" from "none on file". An empty beneficiary or RMD result is
+  never on its own evidence that none exists.
+- `zeroIsUnverified` — a $0 withdrawal total that came from a failed match, not a real zero.
 
-## Assumptions to verify against your Orion entitlements
-These were modelled from Orion's standard v1 API; confirm field names and query-param
-support for your account, then tighten the schemas:
+Feed rep IDs from the entitlement table. Get Signed In User frequently returns a null `rep_id`.
 
-- The `client` / `account` output schemas list common fields. Orion responses are
-  permissive — extra fields pass through, missing ones come back blank. Adjust
-  `methods.client_schema` / `methods.account_schema` to match your actual payloads.
-- Triggers assume `Portfolio/Clients` and `Portfolio/Accounts` accept `orderBy=id desc`
-  and that IDs increase monotonically. If your tenant exposes a `modifiedDate` filter,
-  switch the triggers to a `since`-timestamp cursor for "new **or updated**" semantics —
-  use **Send custom request** to probe what query params your endpoints accept.
+## Open issues (from the 2026-08-29 review, not yet fixed)
+
+Deliberately left as-is so this file stays byte-identical to Workato. Fix in Workato, then re-sync.
+
+1. **Token prefix default.** Defaults to `Bearer`; Orion data endpoints use `Session`. Sign-in
+   succeeds and data calls 401.
+2. **Refresh path unverified.** The previous connector refreshed with the refresh token as a
+   `Bearer` Authorization header and credentials as HTTP headers — no body. This one sends a
+   standard form body. `acquire` is exercised at connect time; `refresh` only fires ~10h later.
+   Force a refresh in staging before depending on it. Also, `refresh_on` covers 401 but not 403.
+3. **Boolean connection fields** are compared with `== true` / `== false`. Checkbox values may
+   arrive as `"true"`/`"false"` strings, in which case both toggles are inert.
+4. **Search term encoding.** `search_accounts_simple` only escapes spaces before interpolating
+   into the URL path.
+5. **`identity_path` is not validated** before being concatenated onto the host.
+6. **Masking gaps.** Diagnostic modes bypass masking; `mask_rows` is one level deep; RMD /
+   beneficiary / systematic rows can carry an unmasked custodian code in `accountId`; error
+   messages interpolate up to 500 raw response bytes into job logs.
+7. **`row_account_keys` includes the row's own `id`,** which can match an unrelated record.
+8. **No pagination.** `top` truncates silently with no indicator that more records exist.
