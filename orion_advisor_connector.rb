@@ -39,12 +39,7 @@
         ],
         default: 'body',
         optional: false,
-        hint: 'F6. Leave on "Request body" unless sign in fails - that is what the original ' \
-              'connector sent and what staging accepts. ' \
-              'RFC 6749 section 2.3.1 says a client MUST NOT use more than one authentication ' \
-              'method per request, so "Both" is rejected outright by many servers (bare 401, ' \
-              'empty body) even when the credentials are perfectly valid. Only try "Basic" if ' \
-              '"Request body" fails, and treat "Both" as a diagnostic, never a default.'
+        hint: 'Leave on "Request body". Try "Basic" only if sign in fails. "Both" breaks RFC 6749 and most servers reject it outright - diagnostic only.'
       },
       {
         name: 'token_app_header',
@@ -53,9 +48,7 @@
         type: :boolean,
         default: false,
         optional: true,
-        hint: 'Off by default because the original working connector did not send it on ' \
-              '/Security/Token. Data endpoints always send it. Enable only if Orion support ' \
-              'confirms the token endpoint requires it.'
+        hint: 'Data endpoints always send it; the token endpoint did not need it. Enable only if Orion support says otherwise.'
       },
       {
         name: 'refresh_style',
@@ -68,12 +61,7 @@
         ],
         default: 'auto',
         optional: false,
-        hint: 'The connector that previously worked against this API refreshed by sending the ' \
-              'refresh token as a Bearer Authorization header, client_id and client_secret as ' \
-              'HTTP headers, and no body at all. This connector sends a standard form body. ' \
-              'Only the ~10 hour access token expiry exercises this path, so a wrong choice here ' \
-              'does not surface until the connection dies overnight. Auto tries the standard ' \
-              'shape first and falls back to the legacy shape rather than failing.'
+        hint: 'Auto tries the standard form body, then the header style the previous connector used. Only the ~10h token expiry exercises this, so a wrong choice surfaces overnight.'
       },
       {
         name: 'redirect_uri',
@@ -112,8 +100,7 @@
         type: :boolean,
         default: true,
         optional: true,
-        hint: 'F4. Runbook T7. Leaves only the last 4 on every action that returns an ' \
-              'account number. Turn off only for a controlled reconciliation run.'
+        hint: 'Leaves only the last 4 on every account number. Turn off only for a controlled reconciliation run.'
       },
       {
         name: 'refuse_tenant_wide',
@@ -122,11 +109,7 @@
         type: :boolean,
         default: false,
         optional: true,
-        hint: 'Orion does not enforce advisor scope on this connection type - omitting a ' \
-              'Representative ID returns the whole tenant. When this is on, any list call that ' \
-              'would go tenant wide raises instead of returning data, which is the only ' \
-              'structural guard available short of impersonation. Leave off only for recipes ' \
-              'that are deliberately tenant wide.'
+        hint: 'Orion does not enforce advisor scope here - omitting a Representative ID returns the whole tenant. When on, unscoped list calls raise instead.'
       }
     ],
     authorization: {
@@ -463,12 +446,12 @@
         [
           { name: 'id', type: :integer },
           { name: 'name', type: :string,
-            hint: 'May be joint, duplicated, or surname only. Do not match on this alone. Confirmed live.' },
+            hint: 'May be joint, duplicated, or surname only. Do not match on this alone.' },
           { name: 'firstName', type: :string,
-            hint: 'Joint clients contain both names joined with "&". Confirmed live.' },
+            hint: 'Joint clients contain both names joined with "&".' },
           { name: 'lastName', type: :string },
           { name: 'email', type: :string },
-          { name: 'homePhone', type: :string, hint: 'Nullable, confirmed live.' },
+          { name: 'homePhone', type: :string },
           { name: 'isActive', type: :boolean },
           { name: 'isDataSharingEntity', type: :boolean },
           { name: 'aum', type: :number },
@@ -482,7 +465,7 @@
         [
           { name: 'id', type: :integer },
           { name: 'number', type: :string,
-            hint: 'F4. Masked to last 4 unless masking is disabled on the connection.' },
+            hint: 'Masked to last 4 unless masking is disabled on the connection.' },
           { name: 'name', type: :string },
           { name: 'lastName', type: :string },
           { name: 'isActive', type: :boolean },
@@ -506,7 +489,7 @@
           { name: 'registration', type: :string, hint: 'Returned by the Simple search, not by the Grid view.' },
           { name: 'registrationId', type: :integer },
           { name: 'feeSchedule', type: :string, hint: 'Uniform across staging. Not a Fee source.' },
-          { name: 'billFrequency', type: :string, hint: 'Uniform across staging.' },
+          { name: 'billFrequency', type: :string },
           { name: 'masterPayoutSchedule', type: :string }
         ]
       end
@@ -520,19 +503,15 @@
            get_signed_in_user: {
       title: 'Get Signed In User',
       subtitle: 'Live Orion identity, plus optional verified user claims from the recipe',
-      description: 'Returns the advisor email who signed in',
+      description: 'Advisor identity, read from Orion on every call',
       input_fields: lambda do
         [
           { name: 'jwt_claims', type: :string, label: 'JWT claims (diagnostic)', optional: true,
-            hint: 'RECIPE SIDE ONLY. Switch this field to formula mode and map the JWT claims datapill. ' \
-                  'Echoed raw in the output so you can see what claims exist. ' \
-                  'The connector cannot read this on its own - it must be mapped here.' },
+            hint: 'Map the JWT claims datapill here in formula mode - the connector cannot read it otherwise.' },
           { name: 'verified_user_email', type: :string, label: 'Verified user email', optional: true,
             hint: 'RECIPE SIDE ONLY. Formula mode, the JWT claims datapill with ["email"] appended.' },
           { name: 'echo_claims', type: :boolean, label: 'Echo raw JWT claims', default: false,
-            hint: 'Off in production. When on, the full claim set is returned in jwtClaimsRaw so ' \
-                  'you can read what Workato actually resolves. Claims are identity data - do not ' \
-                  'leave this on in a recipe that logs its output.' }
+            hint: 'Diagnostic. Returns the full claim set in jwtClaimsRaw. Leave off in production.' }
         ]
       end,
       execute: lambda do |connection, input|
@@ -594,16 +573,12 @@
             hint: 'Live Orion identity vs the value stored at authorization. Diagnostic only.' },
           { name: 'identitySource', type: :string, hint: '"live" or "not_found".' },
           { name: 'verifiedUserEmail', type: :string,
-            hint: 'The Workato verified user, as mapped from the JWT claims datapill in the recipe. ' \
-                  'Reads "not_supplied" when nothing was mapped. THIS is the trustworthy advisor identity ' \
-                  'if it populates - it is platform resolved from a signed JWT, not caller payload.' },
+            hint: 'The Workato verified user from the JWT claims. Trustworthy when populated - platform resolved, not caller supplied.' },
           { name: 'jwtClaimsRaw', type: :string,
             hint: 'Reads "not_echoed" unless Echo raw JWT claims is switched on. Diagnostic only - ' \
                   'the claim set is identity data.' },
           { name: 'jwtClaimsParsed', type: :boolean,
-            hint: 'FALSE means claims were mapped but could not be parsed as JSON, so verifiedUserEmail ' \
-                  'is blank because of a mapping problem rather than because nothing was supplied. ' \
-                  'Null when no claims were mapped at all.' },
+            hint: 'FALSE means claims were mapped but did not parse, so a blank verifiedUserEmail is a mapping bug, not a missing input.' },
           { name: 'verifiedMatchesOrion', type: :boolean,
             hint: 'TRUE means the Workato verified user and the Orion connection are the same person. ' \
                   'FALSE is the ria1 vs ria2 split you have been seeing. Null when either is blank.' }
@@ -613,7 +588,7 @@
     list_clients: {
       title: 'List Clients',
       subtitle: 'Portfolio Clients endpoint, no Grid suffix',
-      description: 'List clients, plain endpoint',
+      description: 'Clients from the plain route. Use the Grid view if this 404s',
       input_fields: lambda do
         [
           { name: 'representativeId', type: :integer, label: 'Representative ID', optional: true,
@@ -622,9 +597,7 @@
           { name: 'isActive', type: :boolean, label: 'Is Active Only', default: true },
           { name: 'top', type: :integer, label: 'Top / Record Limit', default: 200 },
           { name: 'skip', type: :integer, label: 'Skip (paging offset)', optional: true,
-            hint: 'UNCONFIRMED on this endpoint. If Orion ignores it you receive the SAME page ' \
-                  'again - compare pageFirstId against the previous page before treating this as ' \
-                  'paging. pagingUnverified is TRUE whenever this is set.' },
+            hint: 'Unconfirmed on this endpoint. If Orion ignores it you get the same page back - check pageFirstId changed before looping.' },
           { name: 'diagnostic', type: :boolean, label: 'Diagnostic mode', default: false, hint: 'Returns the raw response instead of the mapped output.' }
         ]
       end,
@@ -680,16 +653,12 @@
           { name: 'clientCount', type: :integer },
           { name: 'advisorEmail', type: :string },
           { name: 'repScoped', type: :boolean,
-            hint: 'F1. FALSE means neither a Representative ID nor a Client ID was supplied and this ' \
-                  'is a TENANT WIDE result. Assert on this in the recipe before showing anything to ' \
-                  'an advisor, or switch on "Refuse tenant wide results" on the connection.' },
+            hint: 'FALSE means no Representative ID or Client ID was supplied, so this is the whole tenant. Assert on it, or switch on "Refuse tenant wide results".' },
           { name: 'truncated', type: :boolean,
             hint: 'TRUE means the result hit the record limit and more rows exist that you did not ' \
                   'receive. Never summarize or count a truncated set for an advisor.' },
           { name: 'pagingUnverified', type: :boolean,
-            hint: 'TRUE whenever Skip was supplied. Orion is not confirmed to honour it - if it is ' \
-                  'ignored you get the same page back. Compare pageFirstId with the previous page ' \
-                  'before treating a Skip loop as paging.' },
+            hint: 'TRUE whenever Skip was set. Confirm pageFirstId changed before trusting a Skip loop.' },
           { name: 'pageFirstId', type: :integer, hint: 'First row id in this page. Use it to prove Skip moved.' },
           { name: 'pageLastId', type: :integer, hint: 'Last row id in this page.' },
           { name: 'raw', type: :object, hint: 'Diagnostic mode only. Masked and scrubbed like any other output.' },
@@ -699,8 +668,8 @@
     },
     list_clients_grid: {
       title: 'List Clients (Grid View)',
-      subtitle: 'Confirmed working client list',
-      description: 'Returns the advisor client list',
+      subtitle: 'The reliable client list',
+      description: 'Client list. The reliable one - start here',
       input_fields: lambda do
         [
           { name: 'householdFilter', type: :string, label: 'Household Filter', optional: true, hint: 'Silent no-op server side. Filter the returned array instead.' },
@@ -713,9 +682,7 @@
           { name: 'refreshCache', type: :boolean, label: 'Refresh Cache', default: false },
           { name: 'top', type: :integer, label: 'Top / Record Limit', default: 200, hint: 'Tenant holds roughly 56,000 households. Raise deliberately.' },
           { name: 'skip', type: :integer, label: 'Skip (paging offset)', optional: true,
-            hint: 'UNCONFIRMED on this endpoint. If Orion ignores it you receive the SAME page ' \
-                  'again - compare pageFirstId against the previous page before treating this as ' \
-                  'paging. pagingUnverified is TRUE whenever this is set.' }
+            hint: 'Unconfirmed on this endpoint. If Orion ignores it you get the same page back - check pageFirstId changed before looping.' }
         ]
       end,
       execute: lambda do |connection, input|
@@ -767,9 +734,7 @@
             hint: 'TRUE means the result hit the record limit and more rows exist that you did not ' \
                   'receive. Never summarize or count a truncated set for an advisor.' },
           { name: 'pagingUnverified', type: :boolean,
-            hint: 'TRUE whenever Skip was supplied. Orion is not confirmed to honour it - if it is ' \
-                  'ignored you get the same page back. Compare pageFirstId with the previous page ' \
-                  'before treating a Skip loop as paging.' },
+            hint: 'TRUE whenever Skip was set. Confirm pageFirstId changed before trusting a Skip loop.' },
           { name: 'pageFirstId', type: :integer, hint: 'First row id in this page. Use it to prove Skip moved.' },
           { name: 'pageLastId', type: :integer, hint: 'Last row id in this page.' }
         ]
@@ -778,7 +743,7 @@
     list_accounts_grid: {
       title: 'List Accounts (Grid View)',
       subtitle: 'Account list with household and client join keys',
-      description: 'List all accounts',
+      description: 'Accounts with client and household join keys',
       input_fields: lambda do
         [
           { name: 'accountFilter', type: :string, label: 'Account Filter', optional: true, hint: 'Silent no-op server side. Filter the returned array instead.' },
@@ -790,9 +755,7 @@
           { name: 'returnStyle', type: :string, label: 'Return Style', default: 'Standard' },
           { name: 'top', type: :integer, label: 'Top / Record Limit', default: 50 },
           { name: 'skip', type: :integer, label: 'Skip (paging offset)', optional: true,
-            hint: 'UNCONFIRMED on this endpoint. If Orion ignores it you receive the SAME page ' \
-                  'again - compare pageFirstId against the previous page before treating this as ' \
-                  'paging. pagingUnverified is TRUE whenever this is set.' }
+            hint: 'Unconfirmed on this endpoint. If Orion ignores it you get the same page back - check pageFirstId changed before looping.' }
         ]
       end,
       execute: lambda do |connection, input|
@@ -845,9 +808,7 @@
             hint: 'TRUE means the result hit the record limit and more rows exist that you did not ' \
                   'receive. totalValue and accountCount are both understated when this is TRUE.' },
           { name: 'pagingUnverified', type: :boolean,
-            hint: 'TRUE whenever Skip was supplied. Orion is not confirmed to honour it - if it is ' \
-                  'ignored you get the same page back. Compare pageFirstId with the previous page ' \
-                  'before treating a Skip loop as paging.' },
+            hint: 'TRUE whenever Skip was set. Confirm pageFirstId changed before trusting a Skip loop.' },
           { name: 'pageFirstId', type: :integer, hint: 'First row id in this page. Use it to prove Skip moved.' },
           { name: 'pageLastId', type: :integer, hint: 'Last row id in this page.' }
         ]
@@ -856,7 +817,7 @@
     get_client_registrations: {
       title: 'Get Client Registrations',
       subtitle: 'Registration id, name, and active status',
-      description: 'Get registrations information',
+      description: 'Registrations for one client',
       input_fields: lambda do
         [
           { name: 'clientId', type: :integer, label: 'Client ID', optional: false }
@@ -894,7 +855,7 @@
     list_portfolio_assets: {
       title: 'List Portfolio Assets',
       subtitle: 'Asset holdings for cash classification',
-      description: 'Get Portfolio Assets',
+      description: 'Holdings for a set of account IDs',
       input_fields: lambda do
         [
           { name: 'includeCostBasis', type: :boolean, label: 'Include Cost Basis', default: false },
@@ -922,7 +883,7 @@
             properties: [
               { name: 'id', type: :integer },
               { name: 'accountId', type: :integer },
-              { name: 'accountNumber', type: :string, hint: 'F4. Masked to last 4.' },
+              { name: 'accountNumber', type: :string, hint: 'Masked to last 4.' },
               { name: 'ticker', type: :string },
               { name: 'name', type: :string },
               { name: 'currentShares', type: :number },
@@ -941,7 +902,7 @@
     get_household_portfolio_cards: {
       title: 'Get Household Portfolio Cards',
       subtitle: 'Relationship cards and performance',
-      description: 'Untested against staging',
+      description: 'Household performance cards. Response shape unverified',
       input_fields: lambda do
         [
           { name: 'householdId', type: :integer, label: 'Household ID', optional: false },
@@ -987,7 +948,7 @@
     get_performance_allocation_summary: {
       title: 'Get Performance & Allocation Summary',
       subtitle: 'Composite metrics for At Risk scoring and Outreach',
-      description: 'Untested against staging',
+      description: 'Household performance and allocation. Response shape unverified',
       input_fields: lambda do
         [
           { name: 'householdId', type: :integer, label: 'Household ID', optional: false },
@@ -1032,7 +993,7 @@
     get_benchmark_risk_profile: {
       title: 'Get Benchmark & Risk Profile',
       subtitle: 'Risk score, stress test, benchmark comparison',
-      description: 'Untested against staging',
+      description: 'Household risk and benchmark figures. Response shape unverified',
       input_fields: lambda do
         [
           { name: 'householdId', type: :integer, label: 'Household ID', optional: false }
@@ -1061,7 +1022,7 @@
     get_client_detail: {
       title: 'Get Client Detail',
       subtitle: 'Single client record, standard or verbose',
-      description: 'Get single client detail record',
+      description: 'One client record. Verbose adds portfolio and household members',
       input_fields: lambda do
         [
           { name: 'clientId', type: :integer, label: 'Client ID', optional: false },
@@ -1100,7 +1061,7 @@
       output_fields: lambda do
         [
           { name: 'id', type: :integer },
-          { name: 'name', type: :string, hint: 'e.g. "Lawrence E Sibal". Confirmed live.' },
+          { name: 'name', type: :string, hint: 'e.g. "Lawrence E Sibal".' },
           { name: 'firstName', type: :string },
           { name: 'lastName', type: :string },
           { name: 'salutation', type: :string },
@@ -1109,13 +1070,13 @@
           { name: 'reportName', type: :string },
           { name: 'isActive', type: :boolean },
           { name: 'isDataSharingEntity', type: :boolean },
-          { name: 'globalId', type: :string, hint: 'Stable GUID. Safer join key than any name field. Confirmed live.' },
+          { name: 'globalId', type: :string, hint: 'Stable GUID. Safer join key than any name field.' },
           { name: 'personalId', type: :integer },
           { name: 'aum', type: :number },
           { name: 'cashBalance', type: :number },
           { name: 'additionalAccounts', type: :integer },
-          { name: 'missingInformation', type: :string, hint: 'e.g. "DOB, Email". Empty string means the record is complete. Confirmed live.' },
-          { name: 'dob', type: :string, hint: 'Populated on complete records, e.g. "1968-09-23". Confirmed live. On joint households this is a single date and cannot be attributed to a specific person.' },
+          { name: 'missingInformation', type: :string, hint: 'e.g. "DOB, Email". Empty string means the record is complete.' },
+          { name: 'dob', type: :string, hint: 'Populated on complete records, e.g. "1968-09-23". On joint households this is a single date and cannot be attributed to a specific person.' },
           { name: 'gender', type: :string },
           { name: 'email', type: :string },
           { name: 'webAddress', type: :string },
@@ -1142,7 +1103,7 @@
           { name: 'representativeNumber', type: :string },
           { name: 'brokerDealerName', type: :string },
           { name: 'categoryId', type: :integer },
-          { name: 'category', type: :string, hint: 'e.g. "Household". Confirmed live.' },
+          { name: 'category', type: :string, hint: 'e.g. "Household".' },
           { name: 'advClientCategoryId', type: :integer },
           { name: 'advClientCategory', type: :string },
           { name: 'statementDeliveryMethodId', type: :integer },
@@ -1164,21 +1125,21 @@
           { name: 'createdDate', type: :string },
           { name: 'editedBy', type: :string },
           { name: 'editedDate', type: :string },
-          { name: 'udf5WEALTHBOX', type: :string, hint: 'Intended Wealthbox join key. Null in staging, confirmed live.' },
-          { name: 'udf5CRMID', type: :string, hint: 'Null in staging, confirmed live.' },
-          { name: 'udf5EMONEYCLI', type: :string, hint: 'Null in staging, confirmed live.' },
+          { name: 'udf5WEALTHBOX', type: :string, hint: 'Intended Wealthbox join key. Null in staging' },
+          { name: 'udf5CRMID', type: :string },
+          { name: 'udf5EMONEYCLI', type: :string },
           {
             name: 'portfolio',
             type: :object,
-            hint: 'Verbose only. Requires expand to include Portfolio. Null otherwise. Confirmed live.',
+            hint: 'Verbose only. Requires expand to include Portfolio. Null otherwise.',
             properties: [
               { name: 'name', type: :string },
-              { name: 'firstName', type: :string, hint: 'Joint households carry both names split across firstName and lastName, e.g. "Terry A Montgomery &" and "Rhonda E Montgomery". Confirmed live.' },
+              { name: 'firstName', type: :string, hint: 'Joint households carry both names split across firstName and lastName, e.g. "Terry A Montgomery &" and "Rhonda E Montgomery".' },
               { name: 'lastName', type: :string },
               { name: 'salutation', type: :string },
               { name: 'prefix', type: :string },
               { name: 'suffix', type: :string },
-              { name: 'dob', type: :string, hint: 'One date per household. On a joint record it cannot be attributed to either named person. Confirmed live.' },
+              { name: 'dob', type: :string, hint: 'One date per household. On a joint record it cannot be attributed to either named person.' },
               { name: 'gender', type: :string },
               { name: 'email', type: :string },
               { name: 'webAddress', type: :string },
@@ -1227,7 +1188,7 @@
             name: 'householdMembers',
             type: :array,
             of: :object,
-            hint: 'Verbose only. Requires expand to include HouseholdMembers. Empty array on this staging tenant, confirmed live across multiple joint households. Field names below come from the Swagger model, not a populated response, and must be verified against real data before being trusted.',
+            hint: 'Verbose only, requires expand=HouseholdMembers. Empty on this tenant - the fields below come from Swagger, not real data.',
             properties: [
               { name: 'id', type: :integer },
               { name: 'type', type: :string, hint: 'Ties to the HouseholdMemberTypes reference list, e.g. Spouse, Child. This is the dependents and children source.' },
@@ -1259,7 +1220,7 @@
     search_accounts_simple: {
       title: 'Search Accounts (Simple)',
       subtitle: 'Account inventory by search term',
-      description: 'Account search',
+      description: 'Find accounts by name, number, or client ID',
       input_fields: lambda do
         [
           { name: 'search', type: :string, label: 'Search term', optional: false,
@@ -1267,7 +1228,7 @@
           { name: 'clientId', type: :integer, label: 'Filter to Client ID', optional: true,
             hint: 'Applied after the response returns.' },
           { name: 'maskAccountNumbers', type: :boolean, label: 'Mask account numbers', default: true,
-            hint: 'Runbook T7. Leaves only the last 4. The connection level setting also applies.' }
+            hint: 'Leaves only the last 4. The connection level setting also applies.' }
         ]
       end,
       execute: lambda do |connection, input|
@@ -1319,7 +1280,7 @@
     get_account_value: {
       title: 'Get Account Value',
       subtitle: 'Current or as of date account value',
-      description: 'Get account market value',
+      description: 'Market value for one account, current or as of a date',
       input_fields: lambda do
         [
           { name: 'accountId', type: :integer, label: 'Account ID', optional: false },
@@ -1354,23 +1315,23 @@
       end,
       output_fields: lambda do
         [
-          { name: 'accountId', type: :integer, hint: 'Echoed from the input, not from Orion.' },
+          { name: 'accountId', type: :integer },
           { name: 'id', type: :integer, hint: 'Orion account id. Asserted to equal accountId - a mismatch raises.' },
-          { name: 'value', type: :number, hint: 'Account market value. Confirmed live.' },
-          { name: 'number', type: :string, hint: 'F4. NOW MASKED to last 4. Previously returned in full, which breaches Runbook T7.' },
-          { name: 'name', type: :string, hint: 'Registration name, leading whitespace in staging. Confirmed live.' },
-          { name: 'custodian', type: :string, hint: 'Confirmed live.' },
-          { name: 'clientId', type: :integer, hint: 'Join key back to the client. Confirmed live.' },
-          { name: 'registrationId', type: :integer, hint: 'Confirmed live.' },
-          { name: 'isActive', type: :boolean, hint: 'Confirmed live.' },
-          { name: 'managementStyle', type: :string, hint: '"Invalid" appears in staging, surface as a data quality flag. Confirmed live.' }
+          { name: 'value', type: :number },
+          { name: 'number', type: :string, hint: 'Masked to last 4.' },
+          { name: 'name', type: :string, hint: 'Registration name, leading whitespace in staging.' },
+          { name: 'custodian', type: :string },
+          { name: 'clientId', type: :integer, hint: 'Join key back to the client.' },
+          { name: 'registrationId', type: :integer },
+          { name: 'isActive', type: :boolean },
+          { name: 'managementStyle', type: :string, hint: '"Invalid" appears in staging, surface as a data quality flag.' }
         ]
       end
     },
     get_account_asset_values: {
       title: 'Get Account Asset Values',
       subtitle: 'Holdings with cash rollup',
-      description: 'Get account asset value',
+      description: 'Holdings for one account, with a cash subtotal',
       input_fields: lambda do
         [
           { name: 'accountId', type: :integer, label: 'Account ID', optional: false },
@@ -1421,21 +1382,20 @@
             type: :array,
             of: :object,
             properties: [
-              { name: 'id', type: :integer, hint: 'Confirmed live.' },
-              { name: 'productId', type: :integer, hint: 'Confirmed live.' },
-              { name: 'ticker', type: :string, hint: 'e.g. "CASH:CASH". Confirmed live.' },
-              { name: 'name', type: :string, hint: 'e.g. "Cash Asset". Confirmed live.' },
-              { name: 'assetClass', type: :string, hint: 'e.g. "SW MM Funds Taxable". Confirmed live. Note this does not contain the word cash even on cash positions.' },
-              { name: 'accountNumber', type: :string, hint: 'Null on this tenant, confirmed live. Masked when present.' },
-              { name: 'isCustodialCash', type: :boolean, hint: 'Confirmed live. Authoritative cash signal, now checked before keyword matching.' },
-              { name: 'isTradeExcluded', type: :boolean, hint: 'Confirmed live.' },
-              { name: 'shares', type: :number, hint: 'Confirmed live. The declared currentShares does not exist.' },
-              { name: 'price', type: :number, hint: 'Confirmed live. The declared currentPrice does not exist.' },
-              { name: 'value', type: :number, hint: 'Confirmed live. Per position dollar amount.' },
+              { name: 'id', type: :integer },
+              { name: 'productId', type: :integer },
+              { name: 'ticker', type: :string, hint: 'e.g. "CASH:CASH".' },
+              { name: 'name', type: :string, hint: 'e.g. "Cash Asset".' },
+              { name: 'assetClass', type: :string, hint: 'e.g. "SW MM Funds Taxable". Note this does not contain the word cash even on cash positions.' },
+              { name: 'accountNumber', type: :string, hint: 'Null on this tenant, Masked when present.' },
+              { name: 'isCustodialCash', type: :boolean, hint: 'Authoritative cash signal, now checked before keyword matching.' },
+              { name: 'isTradeExcluded', type: :boolean },
+              { name: 'shares', type: :number, hint: 'The declared currentShares does not exist.' },
+              { name: 'price', type: :number, hint: 'The declared currentPrice does not exist.' },
+              { name: 'value', type: :number, hint: 'Per position dollar amount.' },
               { name: 'currentValue', type: :number, hint: 'Added by the connector, normalized from value.' },
               { name: 'costBasis', type: :number,
-                hint: 'Not present in the confirmed live response on this tenant. Declared so ' \
-                      'costBasisPopulated has a field to read when Orion does return it.' }
+                hint: 'Absent on this tenant. Declared so costBasisPopulated has something to read.' }
             ]
           },
           { name: 'assetCount', type: :integer },
@@ -1452,7 +1412,7 @@
     get_account_transactions: {
       title: 'Get Account Transactions',
       subtitle: 'Date ranged transactions with withdrawal rollup',
-      description: 'Sum YTD distribution transactions',
+      description: 'Transactions in a date range, with a withdrawal subtotal',
       input_fields: lambda do
         [
           { name: 'accountId', type: :integer, label: 'Account ID', optional: false },
@@ -1543,17 +1503,14 @@
           { name: 'endDate', type: :string },
           { name: 'matchedBy', type: :string, hint: 'Warn in the recipe if this reads "description keyword fallback".' },
           { name: 'zeroIsUnverified', type: :boolean,
-            hint: 'TRUE means the account HAD transactions but none matched the withdrawal rule, so the $0 ' \
-                  'is a matching failure, not a real zero. Never report $0 to an advisor when this is true. ' \
-                  'Now also fires when withdrawalTypeIds were supplied but matched nothing - that is the ' \
-                  'case most likely to be believed.' }
+            hint: 'TRUE means the account had transactions but none matched the withdrawal rule, so $0 is a match failure, not a real zero. Never report $0 when this is TRUE.' }
         ]
       end
     },
     get_beneficiaries_by_rep: {
       title: 'Get Beneficiaries (by Rep)',
       subtitle: 'Rep level beneficiary book, filtered to account IDs',
-      description: 'Get beneficiary designations',
+      description: 'Beneficiaries for a rep, filtered to account IDs',
       input_fields: lambda do
         [
           { name: 'repId', type: :integer, label: 'Representative ID', optional: false,
@@ -1597,7 +1554,7 @@
             of: :object,
             properties: [
               { name: 'accountId', type: :string },
-              { name: 'accountNumber', type: :string, hint: 'F4. Masked to last 4.' },
+              { name: 'accountNumber', type: :string, hint: 'Masked to last 4.' },
               { name: 'beneficiaryName', type: :string },
               { name: 'beneficiaryType', type: :string, hint: 'Primary or Contingent.' },
               { name: 'relationship', type: :string },
@@ -1612,14 +1569,14 @@
           { name: 'unmatchedAccountIds', type: :string, hint: 'Ids you asked for that matched nothing. Non empty = investigate.' },
           { name: 'idFormatWarning', type: :string,
             hint: 'Populated when the filter matched nothing but the book was non empty. Distinguishes ' \
-                  '"none on file" from "id space mismatch". This is the A-04 false negative guard.' }
+                  '"none on file" from "id space mismatch".' }
         ]
       end
     },
     get_systematics_by_rep: {
       title: 'Get Systematics (by Rep)',
       subtitle: 'Systematic distribution plans, filtered to account IDs',
-      description: 'Get recurring distribution instructions',
+      description: 'Systematic distributions for a rep, filtered to account IDs',
       input_fields: lambda do
         [
           { name: 'repId', type: :integer, label: 'Representative ID', optional: false },
@@ -1662,7 +1619,7 @@
             of: :object,
             properties: [
               { name: 'accountId', type: :string },
-              { name: 'accountNumber', type: :string, hint: 'F4. Masked to last 4.' },
+              { name: 'accountNumber', type: :string, hint: 'Masked to last 4.' },
               { name: 'amount', type: :number },
               { name: 'frequency', type: :string },
               { name: 'distributionType', type: :string },
@@ -1685,7 +1642,7 @@
     get_rmd_by_rep: {
       title: 'Get RMD (by Rep)',
       subtitle: 'RMD information, filtered to account IDs',
-      description: 'Get RMD applicability status',
+      description: 'RMD figures for a rep, filtered to account IDs',
       input_fields: lambda do
         [
           { name: 'repId', type: :integer, label: 'Representative ID', optional: false },
@@ -1750,7 +1707,7 @@
             of: :object,
             properties: [
               { name: 'accountId', type: :string, hint: 'May be a custodian acct code such as "636-148526". Never coerce this to an integer.' },
-              { name: 'accountNumber', type: :string, hint: 'F4. Masked to last 4.' },
+              { name: 'accountNumber', type: :string, hint: 'Masked to last 4.' },
               { name: 'registrationName', type: :string, hint: 'Real Orion field. Registration owner name.' },
               { name: 'registrationType', type: :string, hint: 'Real Orion field, e.g. IRA, SEP IRA.' },
               { name: 'priorEoyValue', type: :number, hint: 'Real Orion field. Prior end-of-year account value used in the RMD calc.' },
@@ -1764,11 +1721,11 @@
           },
           { name: 'rmdCount', type: :integer },
           { name: 'rmdApplicable', type: :boolean,
-            hint: 'F2. NULL when no account filter was applied - the rep book tells you nothing about ' \
+            hint: 'NULL when no account filter was applied - the rep book tells you nothing about ' \
                   'one client. Only trust true/false when filtered is true.' },
           { name: 'totalRequiredAmount', type: :number },
           { name: 'totalRemainingAmount', type: :number, hint: 'Falls back to rmdRemaining.' },
-          { name: 'filtered', type: :boolean, hint: 'F2. Now reports the truth. Previously said true while filtering nothing.' },
+          { name: 'filtered', type: :boolean, hint: 'Now reports the truth. Previously said true while filtering nothing.' },
           { name: 'rowsBeforeFilter', type: :integer, hint: 'Rep book size. If this is large and rmdCount equals it, the filter did not bite.' },
           { name: 'unmatchedAccountIds', type: :string },
           { name: 'idFormatWarning', type: :string, hint: 'Read this before reporting "no RMD".' }
@@ -1778,7 +1735,7 @@
     list_registrations: {
       title: 'List Registrations',
       subtitle: 'Registration reference list',
-      description: 'Reference data, fetch once at build time',
+      description: 'Registration reference list. Fetch once at build time',
       input_fields: lambda do
         [
           { name: 'isActive', type: :boolean, label: 'Is Active Only', default: true },
@@ -1824,7 +1781,7 @@
     list_transaction_types: {
       title: 'List Transaction Types',
       subtitle: 'Transaction type legend',
-      description: 'Build time reference, fetch once and hard code',
+      description: 'Transaction type IDs. Fetch once, then hard code the withdrawal IDs',
       input_fields: lambda do
         [
           { name: 'withdrawalOnly', type: :boolean, label: 'Withdrawal and distribution types only', default: false,
@@ -1871,7 +1828,7 @@
     },
     list_billing_clients: {
       title: 'List Billing Clients',
-      subtitle: 'Grid endpoint, confirmed live response',
+      subtitle: 'Fee schedule and billing status per client',
       description: 'Client level fee schedule and billing status',
       input_fields: lambda do
         [
@@ -1939,12 +1896,12 @@
             of: :object,
             properties: [
               { name: 'id', type: :integer },
-              { name: 'billClientId', type: :integer, hint: 'Same value as id on this tenant. Confirmed live.' },
+              { name: 'billClientId', type: :integer, hint: 'Same value as id on this tenant.' },
               { name: 'firstName', type: :string },
               { name: 'lastName', type: :string },
-              { name: 'fullName', type: :string, hint: 'Frequently null in staging, confirmed live.' },
+              { name: 'fullName', type: :string, hint: 'Frequently null in staging' },
               { name: 'aum', type: :number },
-              { name: 'statusType', type: :string, hint: 'e.g. "Ready to Bill", "Pending Review". Confirmed live.' },
+              { name: 'statusType', type: :string, hint: 'e.g. "Ready to Bill", "Pending Review".' },
               { name: 'billStatusId', type: :integer },
               { name: 'relatedClients', type: :integer },
               { name: 'recurrentAdjustments', type: :integer },
@@ -1952,7 +1909,7 @@
               { name: 'representativeName', type: :string },
               { name: 'representativeNumber', type: :string },
               { name: 'feeScheduleId', type: :integer, hint: 'Frequently null in staging. Join key to List Billing Schedules when populated.' },
-              { name: 'feeSchedule', type: :string, hint: 'Resolved fee schedule name. Frequently null in staging, confirmed live.' },
+              { name: 'feeSchedule', type: :string, hint: 'Resolved fee schedule name. Frequently null in staging' },
               { name: 'masterPayoutScheduleId', type: :integer },
               { name: 'masterPayoutSchedule', type: :string },
               { name: 'createdBy', type: :string },
@@ -1967,9 +1924,7 @@
             hint: 'FALSE means at least one row has no fee schedule. Say the fee must be confirmed from the ' \
                   'advisory agreement. Never estimate a fee.' },
           { name: 'truncated', type: :boolean,
-            hint: 'TRUE means Orion hit the record limit before the client side clientId / ' \
-                  'representativeNumber filters ran, so the row you were looking for may simply ' \
-                  'not have been in the page that came back.' },
+            hint: 'TRUE means Orion hit the record limit before the client side filters ran, so a missing row may just not have been on this page.' },
           { name: 'pagingUnverified', type: :boolean,
             hint: 'TRUE whenever Skip was supplied. Orion is not confirmed to honour it on this ' \
                   'endpoint - if it is ignored you get the same page back.' },
@@ -1980,7 +1935,7 @@
     list_billing_schedules: {
       title: 'List Billing Schedules',
       subtitle: 'Fee schedule labels, no structured rate field exists',
-      description: 'Fee schedule name and type, for manual read',
+      description: 'Fee schedule names and types. Rates are free text - never parse them',
       input_fields: lambda do
         [
           { name: 'scheduleId', type: :integer, label: 'Schedule ID', optional: true, hint: 'Supplied to fetch a single schedule by path.' },
@@ -2025,13 +1980,13 @@
             of: :object,
             properties: [
               { name: 'id', type: :integer },
-              { name: 'name', type: :string, hint: 'No structured rate field exists. A rate, if present, is embedded as free text here, e.g. "Green Linear <$3MM=-0.80%, >$3MM += 0.70%" or "FPF-0.01". Do not parse a number out of this and present it as the fee. Never estimate a fee.' },
-              { name: 'description', type: :string, hint: 'Frequently null, confirmed live.' },
-              { name: 'type', type: :string, hint: 'e.g. "Linear", "Flat". Confirmed live.' },
-              { name: 'basis', type: :string, hint: 'e.g. "Household", "Account", "Fee Schedule". Confirmed live.' },
+              { name: 'name', type: :string, hint: 'No structured rate field. Any rate is free text inside this name, e.g. "Green Linear <$3MM=-0.80%". Never parse it into a fee - confirm from the advisory agreement.' },
+              { name: 'description', type: :string },
+              { name: 'type', type: :string, hint: 'e.g. "Linear", "Flat".' },
+              { name: 'basis', type: :string, hint: 'e.g. "Household", "Account", "Fee Schedule".' },
               { name: 'minFeeAcctValueThreshold', type: :number },
               { name: 'minimumFee', type: :number },
-              { name: 'billEntityName', type: :string, hint: 'Frequently null, confirmed live.' },
+              { name: 'billEntityName', type: :string },
               { name: 'isActive', type: :boolean },
               { name: 'isPayoutCreditOffset', type: :boolean }
             ]
