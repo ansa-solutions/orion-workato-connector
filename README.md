@@ -159,6 +159,32 @@ account shapes were declared inline per action and had drifted: the plain Client
 Grid view returns. Both are unions now, which is safe because Orion passes extra fields through
 and returns absent ones blank.
 
+**Tighter hints and descriptions.** The field hints had grown into paragraphs carrying things only
+the build team cared about, which buried the parts a recipe builder needs. Removed the internal
+ticket codes (F1/F2/F4/F6, Runbook T7, A-04) and the 40 "Confirmed live" provenance notes, cut the
+multi-sentence hints to one line each, and dropped hints that said nothing actionable. Descriptions
+now say what an action returns instead of repeating its title. The warnings that stop someone
+reporting a wrong number to an advisor — `zeroIsUnverified`, `repScoped`, `idFormatWarning`,
+`truncated`, and the fee-schedule "never parse a rate from this" — were kept deliberately.
+
+**Get Account Asset Values against the published contract.** Checked the action against the Swagger
+pages for `/Portfolio/Accounts/{key}/Assets/Value` and its dated sibling:
+
+- Added `hasValue`, a documented query param on both routes that was missing entirely.
+- Removed `costBasis` from the asset schema. Neither response model contains it, so
+  `costBasisPopulated` could only ever return null. The hint now points at **List Portfolio
+  Assets** with *Include Cost Basis*, which is the route that has the param.
+- Added `valuesPopulated` and `cashAssetCount`, and made `cashPercent` null rather than 0 when
+  there is nothing to take a percentage of. Staging returns every position with `shares`, `price`
+  and `value` at zero while a custodial cash position is plainly present — without these a recipe
+  cannot tell "no cash in this account" from "this tenant carries no valuations", and both render
+  to an advisor as $0.00.
+- Added `pathCalled` so the caller can see which of the two routes was used.
+
+`asOfDate` is correct as it stands: `/Assets/Value/{asOfDate}` is a documented endpoint in its own
+right. Note Swagger types that param as `date-time` while the connector sends `YYYY-MM-DD` — if the
+dated call errors while the plain one works, check the format first.
+
 ## Still open
 
 - **Triggers.** The old polling triggers were dropped and are not restored here. They relied on
