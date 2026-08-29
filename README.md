@@ -77,60 +77,60 @@ Scope is **not** enforced server-side. Orion returns the whole tenant (~56,000 h
 
 Feed rep IDs from the entitlement table. Get Signed In User frequently returns a null `rep_id`.
 
-## Proposed fixes — NOT YET IN WORKATO
+## Review fixes — applied 2026-08-29
 
-> **This branch is ahead of the live connector.** It carries fixes for the issues found in the
-> 2026-08-29 review. Until they are pasted into the Workato editor and confirmed working, the
-> editor and this file disagree. Do not merge to `main` before that paste happens — `main` is
-> supposed to mirror what is running.
-
-Paste order matters. The connector is currently broken on data calls by the first item.
+The findings from the 2026-08-29 review are fixed in the connector above and pasted into the
+Workato editor, so this file mirrors what is running again.
 
 **Auth and connection**
-1. Token header prefix now defaults to `Session` (was `Bearer`), and both code fallbacks match.
+1. Token header prefix defaults to `Session` (was `Bearer`), and both code fallbacks match.
 2. `refresh_on` covers `[401, 403]`.
-3. New `to_bool` method. Checkbox connection values can arrive as `"true"`/`"false"` strings, which
-   made `token_app_header` and `mask_account_numbers` inert. All boolean reads go through it.
-4. New `identity_path` method validates the path is a single-slash relative path before it is
-   concatenated onto the host, so a value carrying a host or a leading `//` can no longer send the
-   access token off-domain.
+3. `to_bool` method. Checkbox connection values can arrive as `"true"`/`"false"` strings, which had
+   left `token_app_header` and `mask_account_numbers` inert. All boolean reads go through it.
+4. `identity_path` method validates the path is a single-slash relative path before it is
+   concatenated onto the host, so a value carrying a host or a leading `//` cannot send the access
+   token off-domain.
 5. Client auth style `basic` no longer also puts `client_id` in the form body.
 
 **Data protection**
-6. New `mask_any` masks recursively, so nested objects (`portfolio`, `householdMembers`) are covered.
-   `mask_rows` and `sanitize_rows` now delegate to it, so every existing call site inherits this.
-7. New `mask_account_id` masks `accountId` when it is not a plain integer — that is how custodian
-   codes like `636-148526` were reaching output unmasked next to a masked `accountNumber`.
+6. `mask_any` masks recursively, so nested objects (`portfolio`, `householdMembers`) are covered.
+   `mask_rows` and `sanitize_rows` delegate to it, so every call site inherits this.
+7. `mask_account_id` masks `accountId` when it is not a plain integer — that is how custodian codes
+   like `636-148526` were reaching output unmasked next to a masked `accountNumber`.
 8. Diagnostic modes route through `sanitize_any` instead of `scrub_pii`, so raw dumps are masked.
-9. New `safe_body` scrubs and masks error-response bodies before they are interpolated into job logs.
-10. `jwtClaimsRaw` is gated behind a new `echo_claims` input, default off.
+9. `safe_body` scrubs and masks error-response bodies before they reach job logs.
+10. `jwtClaimsRaw` is gated behind the `echo_claims` input, default off.
 
 **Correctness**
 11. `row_account_keys` no longer matches on the row's own `id`, which could return another client's
     beneficiary, systematic, or RMD rows through an account filter.
-12. `zeroIsUnverified` now fires whenever a $0 total came from an empty match set, including the
-    typeId path — previously the most believable wrong answer was the one flagged as fine.
-13. Withdrawal totals sum signed and then take magnitude. Added `withdrawalNetSigned` and
-    `mixedSigns` so a contribution caught by the match rule is visible instead of inflating the total.
-14. `costBasisPopulated` returns null when Orion returned no `costBasis` field at all, rather than
-    a hard `false` that reads as "cost basis is missing". `costBasis` added to the asset schema.
+12. `zeroIsUnverified` fires whenever a $0 total came from an empty match set, including the typeId
+    path — previously the most believable wrong answer was the one flagged as fine.
+13. Withdrawal totals sum signed and then take magnitude. `withdrawalNetSigned` and `mixedSigns`
+    make a contribution caught by the match rule visible instead of letting it inflate the total.
+14. `costBasisPopulated` returns null when Orion returned no `costBasis` field at all, rather than a
+    hard `false` that reads as "cost basis is missing". `costBasis` added to the asset schema.
 15. `unwrap_array` unwraps common envelope keys instead of turning `{"data":[…]}` into one row.
 16. `top` guards test `.nil?` rather than truthiness, so `top: 0` no longer passes through as 0.
-17. Search terms are rejected if they contain `/ ? # %`, which could otherwise rewrite the request path.
+17. Search terms containing `/ ? # %` are rejected rather than rewriting the request path.
 
 **Completeness**
 18. Every list action returns `truncated`. `top` was a silent truncation knob against a ~56,000
     household tenant.
 19. `list_billing_clients` defaults `top` to 1000, down from 50000.
 
-### After pasting
+## Still open
 
-Re-sync `orion_advisor_connector.rb` from the editor so the two match byte for byte again, then
-merge. Two things to verify in staging that no amount of reading can settle:
-
-- **Force a token refresh.** `acquire` is exercised at connect time, but `refresh` only fires ~10h
-  later. The previous connector refreshed with the refresh token as a `Bearer` Authorization header
-  and credentials as HTTP headers, no body; this one sends a standard RFC form body. If Orion's
-  endpoint is as non-standard on refresh as the old code implies, the failure mode is "works all
-  day, breaks overnight".
-- **Confirm `Session` is right** for data calls on your tenant before assuming item 1 is settled.
+- **The refresh path has not been exercised.** `acquire` runs at connect time; `refresh` only fires
+  when the ~10h access token expires. The previous connector refreshed with the refresh token as a
+  `Bearer` Authorization header and credentials as HTTP headers, no body — this one sends a standard
+  RFC form body. If Orion's endpoint is as non-standard on refresh as the old code implies, the
+  failure mode is "works all day, breaks overnight". Force a refresh in staging.
+- **No pagination.** `truncated` tells you a result was cut off; it does not let you fetch the rest.
+  Anything needing the full book still needs a paging strategy.
+- **Scope is not enforced server-side.** The connector reports (`repScoped`, `distinctRepIds`) rather
+  than blocking. The previous connector pushed this to Orion via impersonation. Worth revisiting if
+  cross-advisor isolation needs to be structural rather than procedural.
+- **No `object_definitions`.** Client and account schemas are re-declared per action and have already
+  drifted between `list_clients` and `list_clients_grid`.
+- **No triggers.** The old polling triggers were dropped and not replaced.
