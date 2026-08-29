@@ -39,9 +39,11 @@ RFC 6749 §2.3.1 forbids mixing, and many servers answer with a bare 401 and no 
 | Send App header on token requests | Off by default; data endpoints always send `App: OrionConnect`. |
 | Redirect URI | `https://www.workato.com/oauth/callback` — must be registered with Orion. |
 | Scope | Optional, space delimited. |
-| Token header prefix | `Bearer` (default) or `Session`. See the open issues below. |
-| Identity endpoint path | `/api/v1/Authorization/User`. Called at sign-in and by Get Signed In User. |
-| Mask account numbers everywhere | On by default. Leaves only the last 4 on account-number fields. |
+| Token header prefix | `Session` (default) or `Bearer`. Orion data endpoints use `Session`. |
+| Refresh request style | `auto` (default), `form_body`, or `legacy_headers`. See Follow-up changes. |
+| Identity endpoint path | `/api/v1/Authorization/User`. Called at sign-in and by Get Signed In User. Validated as a relative path. |
+| Mask account numbers everywhere | On by default. Leaves only the last 4 on account-number fields, recursively. |
+| Refuse tenant wide results | Off by default. When on, unscoped list calls raise instead of returning the tenant. |
 
 ## Actions (21)
 
@@ -66,7 +68,8 @@ Get Performance & Allocation Summary · Get Benchmark & Risk Profile.
 ## Scoping model — read this before building a recipe
 
 Scope is **not** enforced server-side. Orion returns the whole tenant (~56,000 households) when
-`representativeId` is omitted. The connector reports what it did rather than blocking:
+`representativeId` is omitted. By default the connector reports what it did rather than blocking —
+switch on **Refuse tenant wide results** to make an unscoped list call raise instead:
 
 - `repScoped` — FALSE means the result is tenant-wide. Assert on it before showing anything.
 - `distinctRepIds` — more than the one rep you scoped to means scoping did not take effect.
@@ -119,18 +122,49 @@ Workato editor, so this file mirrors what is running again.
     household tenant.
 19. `list_billing_clients` defaults `top` to 1000, down from 50000.
 
+## Follow-up changes — NOT YET IN WORKATO
+
+> **This branch is ahead of the live connector.** Paste `orion_advisor_connector.rb` into the
+> Workato editor and confirm before merging to `main` — `main` mirrors what is running.
+
+These address the items left open after the 2026-08-29 fixes.
+
+**Refresh resilience.** New `Refresh request style` connection field, default `auto`. The refresh
+path is the one thing nothing has exercised: `acquire` runs at connect time, `refresh` only fires
+at the ~10h expiry, and the previously working connector used a completely different shape
+(refresh token as a `Bearer` header, credentials as HTTP headers, no body). `auto` tries the
+standard RFC form body first and falls back to that legacy shape rather than letting the
+connection die overnight. If both fail, the error carries both attempts' messages. `form_body` and
+`legacy_headers` pin one shape once you know which is right.
+
+**Structural scope guard.** New `Refuse tenant wide results` connection checkbox, default off.
+When on, `List Clients`, `List Clients (Grid View)` and `List Accounts (Grid View)` raise instead
+of returning data if no representative, client, account, or registration filter was supplied.
+Orion does not enforce advisor scope on this connection type, so short of returning to
+impersonation this is the only guard that is structural rather than procedural. `repScoped` now
+also counts a Client ID as scoping, which it always was in practice.
+
+**Paging, honestly labelled.** `Skip` input added to the three list actions plus
+`List Billing Clients`, along with `pagingUnverified`, `pageFirstId` and `pageLastId` outputs.
+**Orion is not confirmed to support `skip` on these routes.** If it is ignored, a recipe looping
+on it gets the same page forever and believes it is paging — so the flag is on by default whenever
+`Skip` is set, and `pageFirstId` gives the recipe something to assert against. Verify against a
+known-large rep book before building anything on it.
+
+**Shared schemas.** New `object_definitions` with `client_row` and `account_row`. The client and
+account shapes were declared inline per action and had drifted: the plain Clients list was missing
+`homePhone` and `isDataSharingEntity`, and the Simple account search was missing everything the
+Grid view returns. Both are unions now, which is safe because Orion passes extra fields through
+and returns absent ones blank.
+
 ## Still open
 
-- **The refresh path has not been exercised.** `acquire` runs at connect time; `refresh` only fires
-  when the ~10h access token expires. The previous connector refreshed with the refresh token as a
-  `Bearer` Authorization header and credentials as HTTP headers, no body — this one sends a standard
-  RFC form body. If Orion's endpoint is as non-standard on refresh as the old code implies, the
-  failure mode is "works all day, breaks overnight". Force a refresh in staging.
-- **No pagination.** `truncated` tells you a result was cut off; it does not let you fetch the rest.
-  Anything needing the full book still needs a paging strategy.
-- **Scope is not enforced server-side.** The connector reports (`repScoped`, `distinctRepIds`) rather
-  than blocking. The previous connector pushed this to Orion via impersonation. Worth revisiting if
-  cross-advisor isolation needs to be structural rather than procedural.
-- **No `object_definitions`.** Client and account schemas are re-declared per action and have already
-  drifted between `list_clients` and `list_clients_grid`.
-- **No triggers.** The old polling triggers were dropped and not replaced.
+- **Triggers.** The old polling triggers were dropped and are not restored here. They relied on
+  `orderBy=id desc` and monotonic ids, neither confirmed for this tenant, and rebuilding them on
+  the same assumptions would reintroduce exactly the kind of unverified behaviour the rest of this
+  work removed. Worth doing deliberately, if anything actually needs event-driven Orion data.
+- **Impersonation.** Dropping it moved scope enforcement from Orion to recipe discipline. The
+  checkbox above is a guard, not equivalence. If cross-advisor isolation has to be structural,
+  running the current action surface on top of impersonation is the real answer.
+- **Real pagination.** `Skip` is a probe, not a solution. A confirmed paging contract, or a
+  narrowing strategy that never needs one, is still outstanding.

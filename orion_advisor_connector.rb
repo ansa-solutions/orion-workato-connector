@@ -58,6 +58,24 @@
               'confirms the token endpoint requires it.'
       },
       {
+        name: 'refresh_style',
+        label: 'Refresh request style',
+        control_type: 'select',
+        pick_list: [
+          ['Auto - standard form body, fall back to legacy headers', 'auto'],
+          ['Form body only (RFC 6749)', 'form_body'],
+          ['Legacy headers only', 'legacy_headers']
+        ],
+        default: 'auto',
+        optional: false,
+        hint: 'The connector that previously worked against this API refreshed by sending the ' \
+              'refresh token as a Bearer Authorization header, client_id and client_secret as ' \
+              'HTTP headers, and no body at all. This connector sends a standard form body. ' \
+              'Only the ~10 hour access token expiry exercises this path, so a wrong choice here ' \
+              'does not surface until the connection dies overnight. Auto tries the standard ' \
+              'shape first and falls back to the legacy shape rather than failing.'
+      },
+      {
         name: 'redirect_uri',
         label: 'Redirect URI',
         default: 'https://www.workato.com/oauth/callback',
@@ -96,6 +114,19 @@
         optional: true,
         hint: 'F4. Runbook T7. Leaves only the last 4 on every action that returns an ' \
               'account number. Turn off only for a controlled reconciliation run.'
+      },
+      {
+        name: 'refuse_tenant_wide',
+        label: 'Refuse tenant wide results',
+        control_type: 'checkbox',
+        type: :boolean,
+        default: false,
+        optional: true,
+        hint: 'Orion does not enforce advisor scope on this connection type - omitting a ' \
+              'Representative ID returns the whole tenant. When this is on, any list call that ' \
+              'would go tenant wide raises instead of returning data, which is the only ' \
+              'structural guard available short of impersonation. Leave off only for recipes ' \
+              'that are deliberately tenant wide.'
       }
     ],
     authorization: {
@@ -140,9 +171,32 @@
         ]
       end,
       refresh: lambda do |connection, refresh_token|
-        res = call('token_request', connection, 'refresh_token',
+        style = (connection['refresh_style'].presence || 'auto').to_s.downcase
+        res =
+          if style == 'legacy_headers'
+            call('legacy_refresh_request', connection, refresh_token)
+          elsif style == 'form_body'
+            call('token_request', connection, 'refresh_token',
+                 'grant_type' => 'refresh_token',
+                 'refresh_token' => refresh_token)
+          else
+            begin
+              call('token_request', connection, 'refresh_token',
                    'grant_type' => 'refresh_token',
                    'refresh_token' => refresh_token)
+            rescue StandardError => standard_error
+              begin
+                call('legacy_refresh_request', connection, refresh_token)
+              rescue StandardError => legacy_error
+                error('Orion token refresh failed in BOTH request styles, so the connection ' \
+                      'cannot renew itself and must be re-authorized. ' \
+                      "Standard form body attempt: #{standard_error.message} " \
+                      "Legacy header attempt: #{legacy_error.message} " \
+                      'If one of these looks like the right shape, pin it on the connection with ' \
+                      '"Refresh request style" so the failing attempt is not made at all.')
+              end
+            end
+          end
         {
           'access_token' => res['access_token'],
           'refresh_token' => res['refresh_token'] || refresh_token,
@@ -235,6 +289,32 @@
                 "Body: #{shown}. Client auth style tried: #{style}. Environment: #{base}. #{diag} " \
                 "Correlation ID: #{call('orion_correlation_id', resp_headers)}")
         end
+    end,
+    legacy_refresh_request: lambda do |connection, refresh_token|
+      # The shape the previously working connector used: refresh token as a Bearer header,
+      # credentials as HTTP headers, no request body at all. Kept as a fallback because the
+      # ~10 hour expiry is the only thing that exercises the refresh path.
+      post("#{connection['environment']}/api/v1/Security/Token")
+        .headers(
+          'Authorization' => "Bearer #{refresh_token}",
+          'Accept' => 'application/json',
+          'client_id' => connection['client_id'],
+          'client_secret' => connection['client_secret']
+        )
+        .after_error_response(/.*/) do |code, resp_body, resp_headers, message|
+          error("legacy header style refresh failed (#{code}): #{message}. " \
+                "Body: #{resp_body.to_s.strip.presence || '(empty)'}. " \
+                "Correlation ID: #{call('orion_correlation_id', resp_headers)}")
+        end
+    end,
+    guard_scope: lambda do |connection, scoped, action_label|
+      if !scoped && call('to_bool', connection['refuse_tenant_wide'], false)
+        error("#{action_label} was called with no representative or client filter, which returns " \
+              'the ENTIRE TENANT. "Refuse tenant wide results" is on for this connection, so the ' \
+              'call was stopped rather than handing back cross advisor data. Supply a ' \
+              'Representative ID from the entitlement table, or a Client ID.')
+      end
+      scoped
     end,
     fetch_identity: lambda do |connection, access_token|
       prefix = connection['token_prefix'].presence || 'Session'
@@ -372,6 +452,66 @@
       body.to_s.gsub(/\d{6,}/) { |d| "*#{d[-4, 4]}" }[0, cap]
     end
   },
+  object_definitions: {
+    # Single source of truth for the row shapes that more than one action returns. These were
+    # declared inline per action and had already drifted - the plain Clients list was missing
+    # homePhone and isDataSharingEntity, and the Simple account search was missing everything
+    # the Grid view returns. Orion passes extra fields through and returns absent ones blank,
+    # so a union is safe.
+    client_row: {
+      fields: lambda do |_connection, _config_fields|
+        [
+          { name: 'id', type: :integer },
+          { name: 'name', type: :string,
+            hint: 'May be joint, duplicated, or surname only. Do not match on this alone. Confirmed live.' },
+          { name: 'firstName', type: :string,
+            hint: 'Joint clients contain both names joined with "&". Confirmed live.' },
+          { name: 'lastName', type: :string },
+          { name: 'email', type: :string },
+          { name: 'homePhone', type: :string, hint: 'Nullable, confirmed live.' },
+          { name: 'isActive', type: :boolean },
+          { name: 'isDataSharingEntity', type: :boolean },
+          { name: 'aum', type: :number },
+          { name: 'representativeId', type: :integer },
+          { name: 'representativeName', type: :string }
+        ]
+      end
+    },
+    account_row: {
+      fields: lambda do |_connection, _config_fields|
+        [
+          { name: 'id', type: :integer },
+          { name: 'number', type: :string,
+            hint: 'F4. Masked to last 4 unless masking is disabled on the connection.' },
+          { name: 'name', type: :string },
+          { name: 'lastName', type: :string },
+          { name: 'isActive', type: :boolean },
+          { name: 'isManaged', type: :boolean },
+          { name: 'isDiscretionary', type: :boolean },
+          { name: 'currentValue', type: :number },
+          { name: 'cashBalance', type: :number,
+            hint: '0 on every staging record. Not a Cash in Brokerage source.' },
+          { name: 'accountType', type: :string,
+            hint: '"Invalid Type" appears - surface as a data quality flag.' },
+          { name: 'accountStatus', type: :string },
+          { name: 'accountStatusDescription', type: :string },
+          { name: 'custodian', type: :string },
+          { name: 'fundFamily', type: :string },
+          { name: 'household', type: :string,
+            hint: 'Populated. No DOBs - cross reference Wealthbox.' },
+          { name: 'representative', type: :string },
+          { name: 'representativeId', type: :integer },
+          { name: 'representativeNumber', type: :string },
+          { name: 'clientId', type: :integer, hint: 'Join key to the client list.' },
+          { name: 'registration', type: :string, hint: 'Returned by the Simple search, not by the Grid view.' },
+          { name: 'registrationId', type: :integer },
+          { name: 'feeSchedule', type: :string, hint: 'Uniform across staging. Not a Fee source.' },
+          { name: 'billFrequency', type: :string, hint: 'Uniform across staging.' },
+          { name: 'masterPayoutSchedule', type: :string }
+        ]
+      end
+    }
+  },
   test: lambda do |connection|
     get('/api/v1/Portfolio/Clients/Grid').params('top' => 1)
       .headers(call('orion_headers', '/portfolio/clients'))
@@ -481,16 +621,23 @@
           { name: 'clientId', type: :integer, label: 'Client ID', optional: true },
           { name: 'isActive', type: :boolean, label: 'Is Active Only', default: true },
           { name: 'top', type: :integer, label: 'Top / Record Limit', default: 200 },
+          { name: 'skip', type: :integer, label: 'Skip (paging offset)', optional: true,
+            hint: 'UNCONFIRMED on this endpoint. If Orion ignores it you receive the SAME page ' \
+                  'again - compare pageFirstId against the previous page before treating this as ' \
+                  'paging. pagingUnverified is TRUE whenever this is set.' },
           { name: 'diagnostic', type: :boolean, label: 'Diagnostic mode', default: false, hint: 'Returns the raw response instead of the mapped output.' }
         ]
       end,
       execute: lambda do |connection, input|
-        limit = input['top'].nil? ? 200 : input['top'].to_i
+        limit  = input['top'].nil? ? 200 : input['top'].to_i
+        scoped = input['representativeId'].present? || input['clientId'].present?
+        call('guard_scope', connection, scoped, 'List Clients')
         params = {
           'representativeId' => input['representativeId'],
           'clientId' => input['clientId'],
           'isActive' => input['isActive'].nil? ? 'true' : input['isActive'].to_s,
-          'top' => limit
+          'top' => limit,
+          'skip' => input['skip']
         }.reject { |_, v| v.nil? }
         res = get('/api/v1/Portfolio/Clients')
           .params(params)
@@ -520,36 +667,31 @@
           'clients' => clients,
           'clientCount' => clients.length,
           'advisorEmail' => connection['user_email'],
-          'repScoped' => input['representativeId'].present?,
-          'truncated' => clients.length >= limit
+          'repScoped' => scoped,
+          'truncated' => clients.length >= limit,
+          'pagingUnverified' => input['skip'].to_i.positive?,
+          'pageFirstId' => clients.first.is_a?(Hash) ? clients.first['id'] : nil,
+          'pageLastId' => clients.last.is_a?(Hash) ? clients.last['id'] : nil
         }
       end,
-      output_fields: lambda do
+      output_fields: lambda do |object_definitions|
         [
-          {
-            name: 'clients',
-            type: :array,
-            of: :object,
-            properties: [
-              { name: 'id', type: :integer },
-              { name: 'name', type: :string },
-              { name: 'firstName', type: :string },
-              { name: 'lastName', type: :string },
-              { name: 'email', type: :string },
-              { name: 'isActive', type: :boolean },
-              { name: 'aum', type: :number },
-              { name: 'representativeId', type: :integer },
-              { name: 'representativeName', type: :string }
-            ]
-          },
+          { name: 'clients', type: :array, of: :object, properties: object_definitions['client_row'] },
           { name: 'clientCount', type: :integer },
           { name: 'advisorEmail', type: :string },
           { name: 'repScoped', type: :boolean,
-            hint: 'F1. FALSE means no Representative ID was supplied and this is a TENANT WIDE result. ' \
-                  'Assert on this in the recipe before showing anything to an advisor.' },
+            hint: 'F1. FALSE means neither a Representative ID nor a Client ID was supplied and this ' \
+                  'is a TENANT WIDE result. Assert on this in the recipe before showing anything to ' \
+                  'an advisor, or switch on "Refuse tenant wide results" on the connection.' },
           { name: 'truncated', type: :boolean,
             hint: 'TRUE means the result hit the record limit and more rows exist that you did not ' \
                   'receive. Never summarize or count a truncated set for an advisor.' },
+          { name: 'pagingUnverified', type: :boolean,
+            hint: 'TRUE whenever Skip was supplied. Orion is not confirmed to honour it - if it is ' \
+                  'ignored you get the same page back. Compare pageFirstId with the previous page ' \
+                  'before treating a Skip loop as paging.' },
+          { name: 'pageFirstId', type: :integer, hint: 'First row id in this page. Use it to prove Skip moved.' },
+          { name: 'pageLastId', type: :integer, hint: 'Last row id in this page.' },
           { name: 'raw', type: :object, hint: 'Diagnostic mode only. Masked and scrubbed like any other output.' },
           { name: 'detectedType', type: :string, hint: 'Diagnostic mode only.' }
         ]
@@ -569,11 +711,18 @@
           { name: 'registrationId', type: :integer, label: 'Registration ID', optional: true },
           { name: 'isActive', type: :boolean, label: 'Is Active Only', default: true },
           { name: 'refreshCache', type: :boolean, label: 'Refresh Cache', default: false },
-          { name: 'top', type: :integer, label: 'Top / Record Limit', default: 200, hint: 'Tenant holds roughly 56,000 households. Raise deliberately.' }
+          { name: 'top', type: :integer, label: 'Top / Record Limit', default: 200, hint: 'Tenant holds roughly 56,000 households. Raise deliberately.' },
+          { name: 'skip', type: :integer, label: 'Skip (paging offset)', optional: true,
+            hint: 'UNCONFIRMED on this endpoint. If Orion ignores it you receive the SAME page ' \
+                  'again - compare pageFirstId against the previous page before treating this as ' \
+                  'paging. pagingUnverified is TRUE whenever this is set.' }
         ]
       end,
       execute: lambda do |connection, input|
-        limit = input['top'].nil? ? 200 : input['top'].to_i
+        limit  = input['top'].nil? ? 200 : input['top'].to_i
+        scoped = input['rep_id'].present? || input['accountId'].present? ||
+                 input['registrationId'].present?
+        call('guard_scope', connection, scoped, 'List Clients (Grid View)')
         params = {
           'householdFilter' => input['householdFilter'].presence,
           'representativeId' => input['rep_id'],
@@ -581,7 +730,8 @@
           'registrationId' => input['registrationId'],
           'isActive' => input['isActive'].nil? ? 'true' : input['isActive'].to_s,
           'refreshCache' => input['refreshCache'].nil? ? 'false' : input['refreshCache'].to_s,
-          'top' => limit
+          'top' => limit,
+          'skip' => input['skip']
         }.reject { |_, v| v.nil? }
         res = get('/api/v1/Portfolio/Clients/Grid')
           .params(params)
@@ -595,40 +745,33 @@
           'clients' => clients,
           'clientCount' => clients.length,
           'advisorEmail' => connection['user_email'],
-          'repScoped' => input['rep_id'].present?,
+          'repScoped' => scoped,
           'distinctRepIds' => reps.join(','),
-          'truncated' => clients.length >= limit
+          'truncated' => clients.length >= limit,
+          'pagingUnverified' => input['skip'].to_i.positive?,
+          'pageFirstId' => clients.first.is_a?(Hash) ? clients.first['id'] : nil,
+          'pageLastId' => clients.last.is_a?(Hash) ? clients.last['id'] : nil
         }
       end,
-      output_fields: lambda do
+      output_fields: lambda do |object_definitions|
         [
-          {
-            name: 'clients',
-            type: :array,
-            of: :object,
-            properties: [
-              { name: 'id', type: :integer },
-              { name: 'name', type: :string, hint: 'May be joint, duplicated, or surname only. Do not match on this alone. Confirmed live.' },
-              { name: 'firstName', type: :string, hint: 'Joint clients contain both names joined with "&". Confirmed live.' },
-              { name: 'lastName', type: :string },
-              { name: 'isActive', type: :boolean },
-              { name: 'aum', type: :number },
-              { name: 'representativeId', type: :integer },
-              { name: 'representativeName', type: :string },
-              { name: 'homePhone', type: :string, hint: 'Nullable, confirmed live.' },
-              { name: 'email', type: :string },
-              { name: 'isDataSharingEntity', type: :boolean }
-            ]
-          },
+          { name: 'clients', type: :array, of: :object, properties: object_definitions['client_row'] },
           { name: 'clientCount', type: :integer },
           { name: 'advisorEmail', type: :string },
           { name: 'repScoped', type: :boolean,
-            hint: 'FALSE means tenant wide. Stop the recipe rather than showing cross rep data.' },
+            hint: 'FALSE means tenant wide. Stop the recipe rather than showing cross rep data, ' \
+                  'or switch on "Refuse tenant wide results" on the connection.' },
           { name: 'distinctRepIds', type: :string,
             hint: 'Cheap assertion: if this holds more than the one rep you scoped to, scoping did not take effect.' },
           { name: 'truncated', type: :boolean,
             hint: 'TRUE means the result hit the record limit and more rows exist that you did not ' \
-                  'receive. Never summarize or count a truncated set for an advisor.' }
+                  'receive. Never summarize or count a truncated set for an advisor.' },
+          { name: 'pagingUnverified', type: :boolean,
+            hint: 'TRUE whenever Skip was supplied. Orion is not confirmed to honour it - if it is ' \
+                  'ignored you get the same page back. Compare pageFirstId with the previous page ' \
+                  'before treating a Skip loop as paging.' },
+          { name: 'pageFirstId', type: :integer, hint: 'First row id in this page. Use it to prove Skip moved.' },
+          { name: 'pageLastId', type: :integer, hint: 'Last row id in this page.' }
         ]
       end
     },
@@ -645,11 +788,18 @@
           { name: 'isActive', type: :boolean, label: 'Is Active Only', default: true },
           { name: 'refreshCache', type: :boolean, label: 'Refresh Cache', default: false },
           { name: 'returnStyle', type: :string, label: 'Return Style', default: 'Standard' },
-          { name: 'top', type: :integer, label: 'Top / Record Limit', default: 50 }
+          { name: 'top', type: :integer, label: 'Top / Record Limit', default: 50 },
+          { name: 'skip', type: :integer, label: 'Skip (paging offset)', optional: true,
+            hint: 'UNCONFIRMED on this endpoint. If Orion ignores it you receive the SAME page ' \
+                  'again - compare pageFirstId against the previous page before treating this as ' \
+                  'paging. pagingUnverified is TRUE whenever this is set.' }
         ]
       end,
       execute: lambda do |connection, input|
-        limit = input['top'].nil? ? 50 : input['top'].to_i
+        limit  = input['top'].nil? ? 50 : input['top'].to_i
+        scoped = input['representativeId'].present? || input['clientId'].present? ||
+                 input['registrationId'].present?
+        call('guard_scope', connection, scoped, 'List Accounts (Grid View)')
         params = {
           'accountFilter' => input['accountFilter'].presence,
           'representativeId' => input['representativeId'],
@@ -658,7 +808,8 @@
           'isActive' => input['isActive'].nil? ? 'true' : input['isActive'].to_s,
           'refreshCache' => input['refreshCache'].nil? ? 'false' : input['refreshCache'].to_s,
           'returnStyle' => input['returnStyle'].presence || 'Standard',
-          'top' => limit
+          'top' => limit,
+          'skip' => input['skip']
         }.reject { |_, v| v.nil? }
         res = get('/api/v1/Portfolio/Accounts/Grid')
           .params(params)
@@ -673,50 +824,32 @@
           'accounts' => accounts,
           'accountCount' => accounts.length,
           'totalValue' => total.round(2),
-          'repScoped' => input['representativeId'].present? || input['clientId'].present?,
-          'truncated' => accounts.length >= limit
+          'repScoped' => scoped,
+          'truncated' => accounts.length >= limit,
+          'pagingUnverified' => input['skip'].to_i.positive?,
+          'pageFirstId' => accounts.first.is_a?(Hash) ? accounts.first['id'] : nil,
+          'pageLastId' => accounts.last.is_a?(Hash) ? accounts.last['id'] : nil
         }
       end,
-      output_fields: lambda do
+      output_fields: lambda do |object_definitions|
         [
-          {
-            name: 'accounts',
-            type: :array,
-            of: :object,
-            properties: [
-              { name: 'id', type: :integer },
-              { name: 'number', type: :string, hint: 'F4. Masked to last 4 unless masking is disabled on the connection.' },
-              { name: 'name', type: :string },
-              { name: 'lastName', type: :string },
-              { name: 'isActive', type: :boolean },
-              { name: 'isManaged', type: :boolean },
-              { name: 'isDiscretionary', type: :boolean },
-              { name: 'currentValue', type: :number },
-              { name: 'cashBalance', type: :number, hint: '0 on every staging record. Not a Cash in Brokerage source.' },
-              { name: 'accountType', type: :string, hint: '"Invalid Type" appears - surface as a data quality flag.' },
-              { name: 'accountStatus', type: :string },
-              { name: 'accountStatusDescription', type: :string },
-              { name: 'custodian', type: :string },
-              { name: 'fundFamily', type: :string },
-              { name: 'household', type: :string, hint: 'Populated. No DOBs - cross reference Wealthbox.' },
-              { name: 'representative', type: :string },
-              { name: 'representativeId', type: :integer },
-              { name: 'representativeNumber', type: :string },
-              { name: 'clientId', type: :integer, hint: 'Join key to the client list.' },
-              { name: 'registrationId', type: :integer },
-              { name: 'feeSchedule', type: :string, hint: 'Uniform across staging. Not a Fee source.' },
-              { name: 'billFrequency', type: :string, hint: 'Uniform across staging.' },
-              { name: 'masterPayoutSchedule', type: :string }
-            ]
-          },
+          { name: 'accounts', type: :array, of: :object, properties: object_definitions['account_row'] },
           { name: 'accountCount', type: :integer, hint: 'Fills "N TOTAL ACCTS" when called with a clientId.' },
           { name: 'totalValue', type: :number,
             hint: 'Sum of currentValue across the rows returned. If truncated is TRUE this is a ' \
                   'partial sum, not the account total.' },
-          { name: 'repScoped', type: :boolean, hint: 'FALSE means tenant wide.' },
+          { name: 'repScoped', type: :boolean,
+            hint: 'FALSE means tenant wide. Switch on "Refuse tenant wide results" on the connection ' \
+                  'to make that raise instead of returning data.' },
           { name: 'truncated', type: :boolean,
             hint: 'TRUE means the result hit the record limit and more rows exist that you did not ' \
-                  'receive. totalValue and accountCount are both understated when this is TRUE.' }
+                  'receive. totalValue and accountCount are both understated when this is TRUE.' },
+          { name: 'pagingUnverified', type: :boolean,
+            hint: 'TRUE whenever Skip was supplied. Orion is not confirmed to honour it - if it is ' \
+                  'ignored you get the same page back. Compare pageFirstId with the previous page ' \
+                  'before treating a Skip loop as paging.' },
+          { name: 'pageFirstId', type: :integer, hint: 'First row id in this page. Use it to prove Skip moved.' },
+          { name: 'pageLastId', type: :integer, hint: 'Last row id in this page.' }
         ]
       end
     },
@@ -1175,25 +1308,9 @@
           'accountIdList' => id_list
         }
       end,
-      output_fields: lambda do
+      output_fields: lambda do |object_definitions|
         [
-          {
-            name: 'accounts',
-            type: :array,
-            of: :object,
-            properties: [
-              { name: 'id', type: :integer },
-              { name: 'number', type: :string, hint: 'Masked to last 4 by default.' },
-              { name: 'name', type: :string },
-              { name: 'accountType', type: :string },
-              { name: 'registration', type: :string },
-              { name: 'registrationId', type: :integer },
-              { name: 'custodian', type: :string },
-              { name: 'clientId', type: :integer },
-              { name: 'isActive', type: :boolean },
-              { name: 'currentValue', type: :number }
-            ]
-          },
+          { name: 'accounts', type: :array, of: :object, properties: object_definitions['account_row'] },
           { name: 'accountCount', type: :integer, hint: 'Fills the "N TOTAL ACCTS" template line.' },
           { name: 'accountIdList', type: :string, hint: 'Comma separated, UNMASKED ids. Feed into the rep level actions.' }
         ]
@@ -1768,6 +1885,8 @@
           { name: 'top', type: :integer, label: 'Top / Record Limit', default: 1000,
             hint: 'Was 50000. Every row is scrubbed and masked in memory, so a tenant sized pull ' \
                   'risks a job timeout. Raise deliberately and watch the truncated flag.' },
+          { name: 'skip', type: :integer, label: 'Skip (paging offset)', optional: true,
+            hint: 'UNCONFIRMED on this endpoint. If Orion ignores it you receive the SAME page again.' },
           { name: 'diagnostic', type: :boolean, label: 'Diagnostic mode', default: false,
             hint: 'Returns the untouched response so the real shape can be read first.' }
         ]
@@ -1777,7 +1896,8 @@
         params = {
           'isActive' => input['isActive'].nil? ? 'true' : input['isActive'].to_s,
           'status' => input['status'].presence,
-          'top' => limit
+          'top' => limit,
+          'skip' => input['skip']
         }.reject { |_, v| v.nil? }
         res = get('/api/v1/Billing/Clients/Grid')
           .params(params)
@@ -1807,7 +1927,8 @@
           'billingClients' => rows,
           'billingClientCount' => rows.length,
           'feeScheduleResolved' => rows.all? { |r| r['feeSchedule'].present? },
-          'truncated' => truncated
+          'truncated' => truncated,
+          'pagingUnverified' => input['skip'].to_i.positive?
         }
       end,
       output_fields: lambda do
@@ -1849,6 +1970,9 @@
             hint: 'TRUE means Orion hit the record limit before the client side clientId / ' \
                   'representativeNumber filters ran, so the row you were looking for may simply ' \
                   'not have been in the page that came back.' },
+          { name: 'pagingUnverified', type: :boolean,
+            hint: 'TRUE whenever Skip was supplied. Orion is not confirmed to honour it on this ' \
+                  'endpoint - if it is ignored you get the same page back.' },
           { name: 'raw', type: :object, hint: 'Diagnostic mode only. Masked and scrubbed like any other output.' }
         ]
       end
