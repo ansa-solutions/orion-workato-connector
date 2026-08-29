@@ -13,9 +13,10 @@ polling triggers and a custom-request escape hatch — was replaced, not evolved
 available at commit `775b3f8`, along with its `orion_connection_only.rb` auth-debugging stub,
 if the impersonation approach is needed again.
 
-> **Keep this file verbatim.** `orion_advisor_connector.rb` is a straight copy of what runs in
-> Workato, with no local edits or added comments, so the two can be diffed directly. Fix things
-> in Workato first, then re-sync here.
+> **Keep this file verbatim.** `orion_advisor_connector.rb` carries no local edits or added
+> comments, so it can be diffed directly against the Workato editor. Fix things in Workato first,
+> then re-sync here — with one exception, noted under **Follow-up changes** below, where `main` is
+> deliberately ahead pending a paste.
 
 ## Authentication — OAuth 2.0 (authorization code), per advisor
 
@@ -122,10 +123,11 @@ Workato editor, so this file mirrors what is running again.
     household tenant.
 19. `list_billing_clients` defaults `top` to 1000, down from 50000.
 
-## Follow-up changes — NOT YET IN WORKATO
+## Follow-up changes — merged, pending paste into Workato
 
-> **This branch is ahead of the live connector.** Paste `orion_advisor_connector.rb` into the
-> Workato editor and confirm before merging to `main` — `main` mirrors what is running.
+> **`main` is ahead of the Workato editor for these.** They are merged here but are not live until
+> `orion_advisor_connector.rb` is pasted into the editor and confirmed. Until that happens this
+> file is the intended state, not the running state. Delete this warning once the paste lands.
 
 These address the items left open after the 2026-08-29 fixes.
 
