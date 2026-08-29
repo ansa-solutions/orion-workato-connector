@@ -1,6 +1,6 @@
 {
   title: 'Orion Advisor Solutions',
-  description: 'Orion API. OAuth 2.0 only. Advisor identity read live from Orion on every Get Signed In User call.',
+  description: 'Orion API. OAuth 2.0 only.',
   connection: {
     fields: [
       {
@@ -13,8 +13,7 @@
         ],
         default: 'https://stagingapi.orionadvisor.com',
         optional: false,
-        hint: 'Must match the environment the OAuth application was registered in. ' \
-              'Production credentials against the staging host return 401 with an empty body.'
+        hint: 'Must match the environment the OAuth application was registered in.'
       },
       {
         name: 'client_id',
@@ -1335,7 +1334,13 @@
       input_fields: lambda do
         [
           { name: 'accountId', type: :integer, label: 'Account ID', optional: false },
-          { name: 'asOfDate', type: :date, label: 'As Of Date', optional: true },
+          { name: 'hasValue', type: :boolean, label: 'Only assets that have value', optional: true,
+            hint: 'Documented query param. TRUE returns only positions with a value, FALSE only those ' \
+                  'without. Leave blank for everything.' },
+          { name: 'asOfDate', type: :date, label: 'As Of Date', optional: true,
+            hint: 'NOT IN THE PUBLISHED CONTRACT. Swagger documents this route as /Assets/Value with no ' \
+                  'date segment, so a date is likely to 404 or be ignored. Verify before trusting a ' \
+                  'historical figure - check pathCalled in the output.' },
           { name: 'cashKeywords', type: :string, label: 'Cash match keywords', default: 'cash,money market,sweep,mmkt',
             hint: 'Comma separated, matched case insensitively against the asset class and name fields. ' \
                   'isCustodialCash is checked first and wins outright when present.' }
@@ -1344,7 +1349,10 @@
       execute: lambda do |connection, input|
         path = "/api/v1/Portfolio/Accounts/#{input['accountId'].to_i}/Assets/Value"
         path = path + "/#{input['asOfDate'].to_date.strftime('%Y-%m-%d')}" if input['asOfDate'].present?
+        params = {}
+        params['hasValue'] = input['hasValue'].to_s unless input['hasValue'].nil?
         res = get(path)
+          .params(params)
           .headers(call('orion_headers', '/portfolio/accounts'))
           .after_error_response(/.*/) do |code, _body, headers, message|
             error("Orion Account Assets Value Error (#{code}): #{message}. " \
@@ -1362,13 +1370,20 @@
         end
         total = assets.inject(0.0) { |sum, a| sum + (a['currentValue'] || a['value'] || 0).to_f }
         cash  = cash_assets.inject(0.0) { |sum, a| sum + (a['currentValue'] || a['value'] || 0).to_f }
+        # Staging returns positions with shares/price/value all zero. Without this flag a
+        # recipe cannot tell "this account holds no cash" from "this tenant carries no
+        # valuations", and both render as $0.00 to an advisor.
+        valued = assets.any? { |a| (a['currentValue'] || a['value'] || 0).to_f != 0 }
         {
           'accountId' => input['accountId'].to_i,
+          'pathCalled' => path,
           'assets' => call('sanitize_rows', connection, assets),
           'assetCount' => assets.length,
+          'valuesPopulated' => valued,
           'totalValue' => total.round(2),
           'cashValue' => cash.round(2),
-          'cashPercent' => total.zero? ? 0 : ((cash / total) * 100).round(2),
+          'cashPercent' => valued ? ((cash / total) * 100).round(2) : nil,
+          'cashAssetCount' => cash_assets.length,
           'cashClassificationFields' => 'isCustodialCash (authoritative), then assetClass, productCategory, assetClassName, name',
           'costBasisPopulated' => assets.any? { |a| a.key?('costBasis') } ?
             assets.any? { |a| (a['costBasis'] || 0).to_f > 0 } : nil
@@ -1387,25 +1402,34 @@
               { name: 'ticker', type: :string, hint: 'e.g. "CASH:CASH".' },
               { name: 'name', type: :string, hint: 'e.g. "Cash Asset".' },
               { name: 'assetClass', type: :string, hint: 'e.g. "SW MM Funds Taxable". Note this does not contain the word cash even on cash positions.' },
-              { name: 'accountNumber', type: :string, hint: 'Null on this tenant, Masked when present.' },
-              { name: 'isCustodialCash', type: :boolean, hint: 'Authoritative cash signal, now checked before keyword matching.' },
+              { name: 'accountNumber', type: :string, hint: 'Empty string on this tenant. Masked when present.' },
+              { name: 'isCustodialCash', type: :boolean, hint: 'Authoritative cash signal, checked before keyword matching.' },
               { name: 'isTradeExcluded', type: :boolean },
               { name: 'shares', type: :number, hint: 'The declared currentShares does not exist.' },
               { name: 'price', type: :number, hint: 'The declared currentPrice does not exist.' },
               { name: 'value', type: :number, hint: 'Per position dollar amount.' },
-              { name: 'currentValue', type: :number, hint: 'Added by the connector, normalized from value.' },
-              { name: 'costBasis', type: :number,
-                hint: 'Absent on this tenant. Declared so costBasisPopulated has something to read.' }
+              { name: 'currentValue', type: :number, hint: 'Added by the connector, normalized from value.' }
             ]
           },
+          { name: 'pathCalled', type: :string,
+            hint: 'The URL actually requested. Check this when using As Of Date - a date segment is not ' \
+                  'in the published contract for this route.' },
           { name: 'assetCount', type: :integer },
-          { name: 'totalValue', type: :number },
-          { name: 'cashValue', type: :number, hint: 'Dollar half of the template line.' },
-          { name: 'cashPercent', type: :number, hint: 'Percent half of the template line.' },
+          { name: 'valuesPopulated', type: :boolean,
+            hint: 'FALSE means every position came back with value 0, so totalValue, cashValue and ' \
+                  'cashPercent are all meaningless. Do not report $0 or 0% cash to an advisor when this ' \
+                  'is FALSE - it means the valuations are missing, not that the account is empty.' },
+          { name: 'totalValue', type: :number, hint: 'Zero and meaningless when valuesPopulated is FALSE.' },
+          { name: 'cashValue', type: :number, hint: 'Dollar half of the template line. Trust only when valuesPopulated is TRUE.' },
+          { name: 'cashPercent', type: :number,
+            hint: 'Percent half of the template line. NULL when there is nothing to take a percentage of.' },
+          { name: 'cashAssetCount', type: :integer,
+            hint: 'How many positions were classified as cash. Non-zero with a $0 cashValue means the ' \
+                  'cash position exists but carries no valuation.' },
           { name: 'cashClassificationFields', type: :string, hint: 'Which fields the match ran against.' },
           { name: 'costBasisPopulated', type: :boolean,
-            hint: 'NULL means Orion returned no costBasis field at all on any position - that is a ' \
-                  '"cannot tell", not a "cost basis is missing". TRUE/FALSE only when the field exists.' }
+            hint: 'Always NULL here - this route does not return costBasis at all. Use List Portfolio ' \
+                  'Assets with Include Cost Basis for that.' }
         ]
       end
     },
