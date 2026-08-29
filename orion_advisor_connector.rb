@@ -1338,9 +1338,8 @@
             hint: 'Documented query param. TRUE returns only positions with a value, FALSE only those ' \
                   'without. Leave blank for everything.' },
           { name: 'asOfDate', type: :date, label: 'As Of Date', optional: true,
-            hint: 'NOT IN THE PUBLISHED CONTRACT. Swagger documents this route as /Assets/Value with no ' \
-                  'date segment, so a date is likely to 404 or be ignored. Verify before trusting a ' \
-                  'historical figure - check pathCalled in the output.' },
+            hint: 'Switches to the /Assets/Value/{asOfDate} route, which returns AUM as of the end of ' \
+                  'that date. Omit for today.' },
           { name: 'cashKeywords', type: :string, label: 'Cash match keywords', default: 'cash,money market,sweep,mmkt',
             hint: 'Comma separated, matched case insensitively against the asset class and name fields. ' \
                   'isCustodialCash is checked first and wins outright when present.' }
@@ -1412,8 +1411,8 @@
             ]
           },
           { name: 'pathCalled', type: :string,
-            hint: 'The URL actually requested. Check this when using As Of Date - a date segment is not ' \
-                  'in the published contract for this route.' },
+            hint: 'The URL actually requested - the dated route when As Of Date was supplied, the plain ' \
+                  'one otherwise.' },
           { name: 'assetCount', type: :integer },
           { name: 'valuesPopulated', type: :boolean,
             hint: 'FALSE means every position came back with value 0, so totalValue, cashValue and ' \
